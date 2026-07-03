@@ -174,6 +174,7 @@ func (c *usageProbeConn) QueryContext(
 				"usage_dedup_key",
 				"project",
 				"agent",
+				"git_branch",
 			},
 			values: [][]driver.Value{
 				usageProbeUsageRow("s-parent", "proj-a", "claude", ts),
@@ -206,6 +207,7 @@ func usageProbeUsageRow(
 		"",
 		project,
 		agent,
+		"",
 	}
 }
 
