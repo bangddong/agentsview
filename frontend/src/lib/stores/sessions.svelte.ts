@@ -12,9 +12,11 @@ import type {
   Session,
   ProjectInfo,
   AgentInfo,
+  BranchInfo,
   SidebarSessionIndexResponse,
   SidebarSessionIndexRow,
 } from "../api/types.js";
+import { BRANCH_LIST_SEP } from "../branchFilters.js";
 import { sync } from "./sync.svelte.js";
 import { events } from "./events.svelte.js";
 import { starred } from "./starred.svelte.js";
@@ -86,6 +88,7 @@ export interface RecentlyDeletedSessions {
 export interface Filters {
   project: string;
   machine: string;
+  branch: string;
   agent: string;
   termination: string;
   date: string;
@@ -104,6 +107,7 @@ function defaultFilters(): Filters {
   return {
     project: "",
     machine: "",
+    branch: "",
     agent: "",
     termination: "",
     date: "",
@@ -150,6 +154,7 @@ export function filtersToParams(
   const p: Record<string, string> = {};
   if (f.project) p["project"] = f.project;
   if (f.machine) p["machine"] = f.machine;
+  if (f.branch) p["git_branch"] = f.branch;
   if (f.agent) p["agent"] = f.agent;
   if (f.termination) p["termination"] = f.termination;
   if (f.date) p["date"] = f.date;
@@ -169,6 +174,17 @@ export function filtersToParams(
 
 function hasDateFilters(f: Filters): boolean {
   return !!(f.date || f.dateFrom || f.dateTo);
+}
+
+function toggleListValue(list: string, value: string, sep: string): string {
+  const current = list ? list.split(sep) : [];
+  const idx = current.indexOf(value);
+  if (idx >= 0) {
+    current.splice(idx, 1);
+  } else {
+    current.push(value);
+  }
+  return current.join(sep);
 }
 
 export function splitExcludeProjectParam(
@@ -220,6 +236,7 @@ export function parseFiltersFromParams(
   return {
     project,
     machine: params["machine"] ?? "",
+    branch: params["git_branch"] ?? "",
     agent: params["agent"] ?? "",
     termination: params["termination"] ?? "",
     date: params["date"] ?? "",
@@ -240,6 +257,7 @@ class SessionsStore {
   projects: ProjectInfo[] = $state([]);
   agents: AgentInfo[] = $state([]);
   machines: string[] = $state([]);
+  branches: BranchInfo[] = $state([]);
   activeSessionId: string | null = $state(null);
   activeSessionUsageVersion: number = $state(0);
   childSessions: Map<string, Session> = $state(new Map());
@@ -273,6 +291,9 @@ class SessionsStore {
   private machinesLoaded: boolean = false;
   private machinesPromise: Promise<void> | null = null;
   private machinesVersion: number = 0;
+  private branchesLoaded: boolean = false;
+  private branchesPromise: Promise<void> | null = null;
+  private branchesVersion: number = 0;
   private sidebarHydrationInflightByVersion = new Map<
     number,
     Map<string, Promise<void>>
@@ -314,6 +335,7 @@ class SessionsStore {
       project: f.project || undefined,
       excludeProject: exclude,
       machine: f.machine || undefined,
+      gitBranch: f.branch || undefined,
       agent: f.agent || undefined,
       termination: f.termination || undefined,
       date: f.date || undefined,
@@ -705,6 +727,31 @@ class SessionsStore {
     return this.machinesPromise;
   }
 
+  async loadBranches() {
+    if (this.branchesLoaded) return;
+    if (this.branchesPromise) return this.branchesPromise;
+    const ver = this.branchesVersion;
+    this.branchesPromise = (async () => {
+      try {
+        configureGeneratedClient();
+        const res = await MetadataService.getApiV1Branches(
+          this.metadataParams,
+        ) as unknown as { branches: BranchInfo[] };
+        if (ver === this.branchesVersion) {
+          this.branches = res.branches;
+          this.branchesLoaded = true;
+        }
+      } catch {
+        // Non-fatal; branches list stays stale.
+      } finally {
+        if (ver === this.branchesVersion) {
+          this.branchesPromise = null;
+        }
+      }
+    })();
+    return this.branchesPromise;
+  }
+
   private setActiveSession(id: string | null) {
     if (id === this.activeSessionId) return;
     this.navigateRead.cancel();
@@ -937,16 +984,7 @@ class SessionsStore {
   }
 
   toggleMachineFilter(machine: string) {
-    const current = this.filters.machine
-      ? this.filters.machine.split(",")
-      : [];
-    const idx = current.indexOf(machine);
-    if (idx >= 0) {
-      current.splice(idx, 1);
-    } else {
-      current.push(machine);
-    }
-    this.filters.machine = current.join(",");
+    this.filters.machine = toggleListValue(this.filters.machine, machine, ",");
     this.setActiveSession(null);
     this.load();
   }
@@ -961,6 +999,21 @@ class SessionsStore {
     return this.filters.machine.split(",");
   }
 
+  toggleBranchFilter(token: string) {
+    this.filters.branch = toggleListValue(
+      this.filters.branch,
+      token,
+      BRANCH_LIST_SEP,
+    );
+    this.setActiveSession(null);
+    this.load();
+  }
+
+  get selectedBranches(): string[] {
+    if (!this.filters.branch) return [];
+    return this.filters.branch.split(BRANCH_LIST_SEP);
+  }
+
   setAgentFilter(agent: string) {
     if (this.filters.agent === agent) {
       this.filters.agent = "";
@@ -972,16 +1025,7 @@ class SessionsStore {
   }
 
   toggleAgentFilter(agent: string) {
-    const current = this.filters.agent
-      ? this.filters.agent.split(",")
-      : [];
-    const idx = current.indexOf(agent);
-    if (idx >= 0) {
-      current.splice(idx, 1);
-    } else {
-      current.push(agent);
-    }
-    this.filters.agent = current.join(",");
+    this.filters.agent = toggleListValue(this.filters.agent, agent, ",");
     this.setActiveSession(null);
     this.load();
   }
@@ -1059,21 +1103,27 @@ class SessionsStore {
       .includes(status);
   }
 
-  get hasActiveFilters(): boolean {
+  // Counts active filter dimensions for the sidebar filter-button badge.
+  // Project is excluded: it is not a control inside the filter dropdown.
+  // The date trio counts as one "date range" dimension.
+  get activeFilterCount(): number {
     const f = this.filters;
-    return !!(
-      f.machine ||
-      f.agent ||
-      f.termination ||
-      f.recentlyActive ||
-      f.hideUnknownProject ||
-      f.dateFrom ||
-      f.dateTo ||
-      f.date ||
-      f.minUserMessages > 0 ||
-      !f.includeOneShot ||
-      f.includeAutomated
-    );
+    let n = 0;
+    if (f.machine) n++;
+    if (f.branch) n++;
+    if (f.agent) n++;
+    if (f.termination) n++;
+    if (f.recentlyActive) n++;
+    if (f.hideUnknownProject) n++;
+    if (f.date || f.dateFrom || f.dateTo) n++;
+    if (f.minUserMessages > 0) n++;
+    if (!f.includeOneShot) n++;
+    if (f.includeAutomated) n++;
+    return n;
+  }
+
+  get hasActiveFilters(): boolean {
+    return this.activeFilterCount > 0;
   }
 
   clearSessionFilters(options: ClearSessionFiltersOptions = {}) {
@@ -1213,6 +1263,8 @@ class SessionsStore {
   }
 
   invalidateFilterCaches() {
+    const reloadBranches =
+      this.branchesLoaded || this.branchesPromise !== null;
     this.projectsVersion++;
     this.projectsLoaded = false;
     this.projectsPromise = null;
@@ -1222,9 +1274,13 @@ class SessionsStore {
     this.machinesVersion++;
     this.machinesLoaded = false;
     this.machinesPromise = null;
+    this.branchesVersion++;
+    this.branchesLoaded = false;
+    this.branchesPromise = null;
     this.loadProjects();
     this.loadAgents();
     this.loadMachines();
+    if (reloadBranches) this.loadBranches();
     sync.loadStats(this.metadataParams);
   }
 
