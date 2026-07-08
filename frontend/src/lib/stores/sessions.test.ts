@@ -27,6 +27,7 @@ const api = vi.hoisted(() => ({
   getProjects: vi.fn(),
   getAgents: vi.fn(),
   getMachines: vi.fn(),
+  getBranches: vi.fn(),
   deleteSession: vi.fn(),
   batchDeleteSessions: vi.fn(),
   restoreSession: vi.fn(),
@@ -90,6 +91,7 @@ vi.mock("../api/generated/index", () => ({
     getApiV1Projects: vi.fn((params) => api.getProjects(params)),
     getApiV1Agents: vi.fn((params) => api.getAgents(params)),
     getApiV1Machines: vi.fn((params) => api.getMachines(params)),
+    getApiV1Branches: vi.fn((params) => api.getBranches(params)),
     getApiV1Stats: vi.fn((params) => api.getStats(params)),
   },
 }));
@@ -312,6 +314,24 @@ describe("SessionsStore", () => {
       const store = createSessionsStore();
       expect(store.filters.project).toBe("");
       expect(store.filters.includeOneShot).toBe(true);
+    });
+  });
+
+  describe("loadBranches", () => {
+    it("requests branch options with scope all", async () => {
+      vi.mocked(api.getBranches).mockResolvedValue({
+        branches: [
+          { project: "proj", branch: "main", token: "proj\u001fmain" },
+        ],
+      });
+      await sessions.loadBranches();
+
+      expect(api.getBranches).toHaveBeenCalledWith(
+        expect.objectContaining({ scope: "all" }),
+      );
+      expect(sessions.branches).toEqual([
+        { project: "proj", branch: "main", token: "proj\u001fmain" },
+      ]);
     });
   });
 
