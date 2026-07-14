@@ -3,5 +3,6 @@
 /* tslint:disable */
 /* eslint-disable */
 export type ApiErrorResponse = {
+  code?: string;
   error: string;
 };

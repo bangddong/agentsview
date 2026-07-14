@@ -12,7 +12,6 @@ import type {
   Session,
   ProjectInfo,
   AgentInfo,
-  BranchInfo,
   SidebarSessionIndexResponse,
   SidebarSessionIndexRow,
 } from "../api/types.js";
@@ -247,7 +246,6 @@ class SessionsStore {
   projects: ProjectInfo[] = $state([]);
   agents: AgentInfo[] = $state([]);
   machines: string[] = $state([]);
-  branches: BranchInfo[] = $state([]);
   activeSessionId: string | null = $state(null);
   activeSessionUsageVersion: number = $state(0);
   childSessions: Map<string, Session> = $state(new Map());
@@ -281,9 +279,6 @@ class SessionsStore {
   private machinesLoaded: boolean = false;
   private machinesPromise: Promise<void> | null = null;
   private machinesVersion: number = 0;
-  private branchesLoaded: boolean = false;
-  private branchesPromise: Promise<void> | null = null;
-  private branchesVersion: number = 0;
   private sidebarHydrationInflightByVersion = new Map<
     number,
     Map<string, Promise<void>>
@@ -717,34 +712,6 @@ class SessionsStore {
     return this.machinesPromise;
   }
 
-  async loadBranches() {
-    if (this.branchesLoaded) return;
-    if (this.branchesPromise) return this.branchesPromise;
-    const ver = this.branchesVersion;
-    this.branchesPromise = (async () => {
-      try {
-        configureGeneratedClient();
-        // scope "all": the sidebar index matches subagent/fork sessions
-        // against the branch filter, so branches that exist only on
-        // sub-sessions (e.g. worktree subagents) must be selectable here.
-        const res = await MetadataService.getApiV1Branches(
-          { ...this.metadataParams, scope: "all" },
-        ) as unknown as { branches: BranchInfo[] };
-        if (ver === this.branchesVersion) {
-          this.branches = res.branches;
-          this.branchesLoaded = true;
-        }
-      } catch {
-        // Non-fatal; branches list stays stale.
-      } finally {
-        if (ver === this.branchesVersion) {
-          this.branchesPromise = null;
-        }
-      }
-    })();
-    return this.branchesPromise;
-  }
-
   private setActiveSession(id: string | null) {
     if (id === this.activeSessionId) return;
     this.navigateRead.cancel();
@@ -992,14 +959,18 @@ class SessionsStore {
     return this.filters.machine.split(",");
   }
 
+  setBranchFilters(values: string[]) {
+    this.filters.branch = values.join(BRANCH_LIST_SEP);
+    this.setActiveSession(null);
+    this.load();
+  }
+
   toggleBranchFilter(token: string) {
-    this.filters.branch = toggleListValue(
+    this.setBranchFilters(toggleListValue(
       this.filters.branch,
       token,
       BRANCH_LIST_SEP,
-    );
-    this.setActiveSession(null);
-    this.load();
+    ).split(BRANCH_LIST_SEP).filter(Boolean));
   }
 
   get selectedBranches(): string[] {
@@ -1256,8 +1227,6 @@ class SessionsStore {
   }
 
   invalidateFilterCaches() {
-    const reloadBranches =
-      this.branchesLoaded || this.branchesPromise !== null;
     this.projectsVersion++;
     this.projectsLoaded = false;
     this.projectsPromise = null;
@@ -1267,13 +1236,9 @@ class SessionsStore {
     this.machinesVersion++;
     this.machinesLoaded = false;
     this.machinesPromise = null;
-    this.branchesVersion++;
-    this.branchesLoaded = false;
-    this.branchesPromise = null;
     this.loadProjects();
     this.loadAgents();
     this.loadMachines();
-    if (reloadBranches) this.loadBranches();
     sync.loadStats(this.metadataParams);
   }
 
