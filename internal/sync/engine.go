@@ -129,20 +129,25 @@ type Engine struct {
 	// idPrefix and pathRewriter support remote sync:
 	// prefix all session IDs to avoid collisions, rewrite
 	// temp paths to "host:/remote/path" form.
-	ephemeral               bool
-	idPrefix                string
-	pathRewriter            func(string) string
-	emitter                 Emitter
-	providerFactories       map[parser.AgentType]parser.ProviderFactory
-	providerMigrationModes  map[parser.AgentType]parser.ProviderMigrationMode
-	omnigentRetryMu         gosync.Mutex
-	omnigentRetrySources    map[string]*omnigentRetryEntry
-	omnigentRetryContainers map[string]map[string]struct{}
-	omnigentRetryHead       *omnigentRetryEntry
-	omnigentRetryTail       *omnigentRetryEntry
-	omnigentHintMu          gosync.Mutex
-	omnigentHintCursors     map[string]omnigentHintCursor
-	resyncOmnigentAdvanced  atomic.Bool
+	ephemeral              bool
+	idPrefix               string
+	pathRewriter           func(string) string
+	emitter                Emitter
+	providerFactories      map[parser.AgentType]parser.ProviderFactory
+	providerMigrationModes map[parser.AgentType]parser.ProviderMigrationMode
+	// containerSchedulers holds the per-agent identity hooks for the
+	// shared-container scheduling capability, resolved once at construction.
+	// The retry queue, hint cursors, and resync flag below are its state; see
+	// container_scheduling.go.
+	containerSchedulers     map[parser.AgentType]parser.ContainerScheduler
+	containerRetryMu        gosync.Mutex
+	containerRetrySources   map[string]*containerRetryEntry
+	containerRetryGroups    map[string]map[string]struct{}
+	containerRetryHead      *containerRetryEntry
+	containerRetryTail      *containerRetryEntry
+	containerHintMu         gosync.Mutex
+	containerHintCursors    map[string]containerHintCursor
+	resyncContainerAdvanced atomic.Bool
 	projectIdentityMu       gosync.Mutex
 	projectIdentityCache    map[string]projectIdentityCacheEntry
 	projectIdentityWritten  map[string]struct{}
@@ -284,6 +289,7 @@ func NewEngine(
 	if cfg.ProviderMigrationModes != nil {
 		maps.Copy(providerModes, cfg.ProviderMigrationModes)
 	}
+	factoryMap := providerFactoryMap(providerFactories)
 
 	e := &Engine{
 		db:                      database,
@@ -299,9 +305,10 @@ func NewEngine(
 		idPrefix:                cfg.IDPrefix,
 		pathRewriter:            cfg.PathRewriter,
 		emitter:                 cfg.Emitter,
-		providerFactories:       providerFactoryMap(providerFactories),
+		providerFactories:       factoryMap,
 		providerMigrationModes:  providerModes,
-		omnigentHintCursors:     make(map[string]omnigentHintCursor),
+		containerSchedulers:     containerSchedulerMap(factoryMap),
+		containerHintCursors:    make(map[string]containerHintCursor),
 		projectIdentityCache:    make(map[string]projectIdentityCacheEntry),
 		projectIdentityWritten:  make(map[string]struct{}),
 		startupMaintenanceReady: make(chan struct{}),
@@ -770,15 +777,15 @@ func (e *Engine) classifyProviderChangedPath(
 			continue
 		}
 		for _, watchRoot := range watchRoots {
-			if agentType == parser.AgentOmnigent &&
-				!omnigentChangedPathOwnedByWatchRoot(path, watchRoot) {
+			if scheduler, ok := e.containerSchedulers[agentType]; ok &&
+				!containerChangedPathOwnedByWatchRoot(scheduler, path, watchRoot) {
 				continue
 			}
 			var storedSourcePaths []string
-			var omnigentHintClaimed bool
+			var hintPageClaimed bool
 			if provider.Capabilities().Source.StoredSourceHints == parser.CapabilitySupported {
 				var err error
-				storedSourcePaths, omnigentHintClaimed, err = e.changedPathStoredSourcePaths(
+				storedSourcePaths, hintPageClaimed, err = e.changedPathStoredSourcePaths(
 					def.Type, watchRoot,
 				)
 				if err != nil {
@@ -797,8 +804,8 @@ func (e *Engine) classifyProviderChangedPath(
 					StoredSourcePaths: storedSourcePaths,
 				},
 			)
-			if omnigentHintClaimed {
-				e.finishOmnigentStoredHintPage(watchRoot, err == nil)
+			if hintPageClaimed {
+				e.finishContainerStoredHintPage(def.Type, watchRoot, err == nil)
 			}
 			if err != nil {
 				if !errors.Is(err, parser.ErrUnsupportedProviderFeature) {
@@ -850,120 +857,6 @@ func (e *Engine) classifyProviderChangedPath(
 		}
 	}
 	return files
-}
-
-func omnigentChangedPathOwnedByWatchRoot(path, watchRoot string) bool {
-	if container, _, virtual := parser.ParseOmnigentVirtualSourcePath(path); virtual {
-		path = container
-	}
-	rel, err := filepath.Rel(filepath.Clean(watchRoot), filepath.Clean(path))
-	return err == nil && rel != "." && filepath.Dir(rel) == "."
-}
-
-const (
-	omnigentStoredHintBatchSize = 32
-	omnigentRetryBatchSize      = 32
-)
-
-type omnigentHintCursor struct {
-	after          string
-	nextAfter      string
-	active         bool
-	inFlight       bool
-	completeOnDone bool
-	reactivate     bool
-}
-
-func (e *Engine) changedPathStoredSourcePaths(
-	agent parser.AgentType, watchRoot string,
-) ([]string, bool, error) {
-	if agent != parser.AgentOmnigent {
-		paths, err := e.db.ListStoredSourcePathHints(string(agent), []string{watchRoot})
-		return paths, false, err
-	}
-	return e.nextOmnigentStoredHintPage(
-		watchRoot, true, omnigentStoredHintBatchSize,
-	)
-}
-
-func (e *Engine) nextOmnigentStoredHintPage(
-	watchRoot string, activate bool, limit int,
-) ([]string, bool, error) {
-	if limit <= 0 {
-		return nil, false, nil
-	}
-	key := string(parser.AgentOmnigent) + "\x00" + filepath.Clean(watchRoot)
-	e.omnigentHintMu.Lock()
-	defer e.omnigentHintMu.Unlock()
-	if e.omnigentHintCursors == nil {
-		e.omnigentHintCursors = make(map[string]omnigentHintCursor)
-	}
-	cursor := e.omnigentHintCursors[key]
-	if activate {
-		if cursor.active {
-			cursor.reactivate = true
-		} else {
-			cursor.active = true
-			cursor.after = ""
-		}
-		e.omnigentHintCursors[key] = cursor
-	}
-	if !cursor.active || cursor.inFlight {
-		return nil, false, nil
-	}
-	paths, err := e.db.ListStoredSourcePathHintPage(
-		string(parser.AgentOmnigent), watchRoot, cursor.after,
-		limit,
-	)
-	if err != nil {
-		return nil, false, err
-	}
-	if len(paths) == 0 {
-		if cursor.reactivate {
-			cursor = omnigentHintCursor{active: true}
-		} else {
-			cursor = omnigentHintCursor{}
-		}
-		e.omnigentHintCursors[key] = cursor
-		return nil, false, nil
-	}
-	cursor.inFlight = true
-	cursor.nextAfter = ""
-	cursor.completeOnDone = len(paths) < limit
-	if len(paths) == limit {
-		cursor.nextAfter = paths[len(paths)-1]
-	}
-	e.omnigentHintCursors[key] = cursor
-	return paths, true, nil
-}
-
-func (e *Engine) finishOmnigentStoredHintPage(
-	watchRoot string, success bool,
-) {
-	key := string(parser.AgentOmnigent) + "\x00" + filepath.Clean(watchRoot)
-	e.omnigentHintMu.Lock()
-	defer e.omnigentHintMu.Unlock()
-	cursor := e.omnigentHintCursors[key]
-	if !cursor.inFlight {
-		return
-	}
-	if success {
-		cursor.after = cursor.nextAfter
-		if cursor.completeOnDone {
-			if cursor.reactivate {
-				cursor.active = true
-				cursor.after = ""
-				cursor.reactivate = false
-			} else {
-				cursor.active = false
-				cursor.after = ""
-			}
-		}
-	}
-	cursor.inFlight = false
-	cursor.nextAfter = ""
-	cursor.completeOnDone = false
-	e.omnigentHintCursors[key] = cursor
 }
 
 func providerChangedPathWatchRoots(
@@ -1402,10 +1295,10 @@ func (e *Engine) resyncAllWithOptionsLocked(
 ) (stats SyncStats, retErr error) {
 	ops = ops.withDefaults()
 	resyncAccepted := false
-	e.resyncOmnigentAdvanced.Store(false)
+	e.resyncContainerAdvanced.Store(false)
 	defer func() {
-		if e.resyncOmnigentAdvanced.Load() && !resyncAccepted {
-			e.queueOmnigentContainerRetries()
+		if e.resyncContainerAdvanced.Load() && !resyncAccepted {
+			e.queueContainerRetriesAfterAbortedResync()
 		}
 	}()
 	reportResyncProgress := func(p Progress) {
@@ -2922,13 +2815,14 @@ func (e *Engine) discoverProviderSources(
 			Machine:            e.machine,
 			ForceFullDiscovery: forceFullDiscovery,
 		})
-		reconcileOmnigentFirst := !forceFullDiscovery &&
-			agentType == parser.AgentOmnigent &&
-			e.omnigentStoredHintSweepActive(filteredRoots)
+		containerScheduler, containerScheduled := e.containerSchedulers[agentType]
+		reconcileContainersFirst := !forceFullDiscovery &&
+			containerScheduled &&
+			e.containerStoredHintSweepActive(agentType, filteredRoots)
 		tDiscover := time.Now()
 		var sources []parser.SourceRef
 		var err error
-		if !reconcileOmnigentFirst {
+		if !reconcileContainersFirst {
 			sources, err = provider.Discover(ctx)
 		}
 		// Log only providers whose discovery is slow enough to matter, so a
@@ -2947,14 +2841,14 @@ func (e *Engine) discoverProviderSources(
 		}
 		currentSources := providerSourcePathSet(sources)
 		forceParseSources := map[string]struct{}{}
-		if !forceFullDiscovery && agentType == parser.AgentOmnigent {
+		if !forceFullDiscovery && containerScheduled {
 			activatedRoots := make(map[string]struct{})
 			for _, source := range sources {
 				if !source.ReconcileStoredHints {
 					continue
 				}
 				container := providerDiscoveredPath(source)
-				if parsed, _, virtual := parser.ParseOmnigentVirtualSourcePath(container); virtual {
+				if parsed, _, virtual := containerScheduler.SplitContainerMemberPath(container); virtual {
 					container = parsed
 				}
 				watchRoot := filepath.Dir(container)
@@ -2962,21 +2856,21 @@ func (e *Engine) discoverProviderSources(
 					continue
 				}
 				activatedRoots[watchRoot] = struct{}{}
-				e.activateOmnigentStoredHintSweep(watchRoot)
+				e.activateContainerStoredHintSweep(agentType, watchRoot)
 			}
 			sources = slices.DeleteFunc(sources, func(source parser.SourceRef) bool {
 				return source.ReconcileOnly
 			})
 			currentSources = providerSourcePathSet(sources)
 			reconciliationSources, reconciliationFailures :=
-				e.discoverOmnigentReconciliationSources(
-					ctx, provider, currentSources,
-					max(omnigentStoredHintBatchSize-len(sources), 0),
+				e.discoverContainerReconciliationSources(
+					ctx, agentType, provider, currentSources,
+					max(containerStoredHintBatchSize-len(sources), 0),
 				)
 			sources = append(sources, reconciliationSources...)
 			failures += reconciliationFailures
-			retrySources, retryFailures := e.discoverOmnigentRetrySources(
-				ctx, provider, currentSources,
+			retrySources, retryFailures := e.discoverContainerRetrySources(
+				ctx, agentType, provider, currentSources,
 			)
 			sources = append(sources, retrySources...)
 			failures += retryFailures
@@ -3062,192 +2956,6 @@ func providerSourcePathSet(sources []parser.SourceRef) map[string]struct{} {
 		seen[filepath.Clean(path)] = struct{}{}
 	}
 	return seen
-}
-
-func (e *Engine) discoverOmnigentRetrySources(
-	ctx context.Context,
-	provider parser.Provider,
-	currentSources map[string]struct{},
-) ([]parser.SourceRef, int) {
-	e.omnigentRetryMu.Lock()
-	pageSize := min(omnigentRetryBatchSize, len(e.omnigentRetrySources))
-	pending := make([]omnigentRetrySource, 0, pageSize)
-	entry := e.omnigentRetryHead
-	for entry != nil && len(pending) < pageSize {
-		next := entry.next
-		pending = append(pending, entry.omnigentRetrySource)
-		e.moveOmnigentRetryToTailLocked(entry)
-		entry = next
-	}
-	e.omnigentRetryMu.Unlock()
-
-	var sources []parser.SourceRef
-	var failures int
-	for _, retry := range pending {
-		if retry.recovery {
-			recovered, err := provider.SourcesForChangedPath(
-				ctx,
-				parser.ChangedPathRequest{
-					Path:      retry.filePath,
-					EventKind: parser.ChangedPathEventRecovery,
-					WatchRoot: filepath.Dir(retry.filePath),
-				},
-			)
-			if err != nil {
-				log.Printf("%s provider recovery lookup: %v", parser.AgentOmnigent, err)
-				failures++
-				continue
-			}
-			if len(recovered) < omnigentRetryBatchSize {
-				e.omnigentRetryMu.Lock()
-				entry := e.omnigentRetrySources[retry.key()]
-				if entry != nil && entry.reactivate {
-					entry.reactivate = false
-				} else {
-					e.removeOmnigentRetryLocked(retry.key())
-				}
-				e.omnigentRetryMu.Unlock()
-			}
-			for _, source := range recovered {
-				path := filepath.Clean(providerDiscoveredPath(source))
-				if path == "." {
-					continue
-				}
-				if _, exists := currentSources[path]; exists {
-					continue
-				}
-				currentSources[path] = struct{}{}
-				sources = append(sources, source)
-			}
-			continue
-		}
-		source, found, err := provider.FindSource(ctx, parser.FindSourceRequest{
-			FullSessionID:      retry.sessionID,
-			StoredFilePath:     retry.filePath,
-			FingerprintKey:     retry.filePath,
-			PreferStoredSource: true,
-		})
-		if err != nil {
-			log.Printf("%s provider retry lookup: %v", parser.AgentOmnigent, err)
-			failures++
-			continue
-		}
-		if !found {
-			continue
-		}
-		path := filepath.Clean(providerDiscoveredPath(source))
-		if _, exists := currentSources[path]; exists {
-			continue
-		}
-		currentSources[path] = struct{}{}
-		sources = append(sources, source)
-	}
-	return sources, failures
-}
-
-func (e *Engine) discoverOmnigentReconciliationSources(
-	ctx context.Context,
-	provider parser.Provider,
-	currentSources map[string]struct{},
-	limit int,
-) ([]parser.SourceRef, int) {
-	if limit <= 0 {
-		return nil, 0
-	}
-	plan, err := provider.WatchPlan(ctx)
-	if err != nil {
-		log.Printf("%s provider reconciliation watch plan: %v", parser.AgentOmnigent, err)
-		return nil, 1
-	}
-	var sources []parser.SourceRef
-	var failures int
-	for _, watchRoot := range plan.Roots {
-		hints, claimed, err := e.nextOmnigentStoredHintPage(
-			watchRoot.Path, false, limit-len(sources),
-		)
-		if err != nil {
-			log.Printf("%s provider reconciliation hints: %v", parser.AgentOmnigent, err)
-			failures++
-			continue
-		}
-		if len(hints) == 0 {
-			continue
-		}
-		classified := false
-		for _, include := range watchRoot.IncludeGlobs {
-			if include == "" || strings.ContainsAny(include, `*?[\`) {
-				continue
-			}
-			container := filepath.Join(watchRoot.Path, include)
-			if !parser.IsRegularFile(container) {
-				continue
-			}
-			matches, err := provider.SourcesForChangedPath(
-				ctx,
-				parser.ChangedPathRequest{
-					Path:              container,
-					EventKind:         parser.ChangedPathEventReconcile,
-					WatchRoot:         watchRoot.Path,
-					StoredSourcePaths: hints,
-				},
-			)
-			if err != nil {
-				log.Printf(
-					"%s provider reconciliation classification: %v",
-					parser.AgentOmnigent, err,
-				)
-				failures++
-				continue
-			}
-			classified = true
-			for _, source := range matches {
-				path := filepath.Clean(providerDiscoveredPath(source))
-				if path == "." {
-					continue
-				}
-				if _, exists := currentSources[path]; exists {
-					continue
-				}
-				currentSources[path] = struct{}{}
-				sources = append(sources, source)
-			}
-		}
-		if claimed {
-			e.finishOmnigentStoredHintPage(watchRoot.Path, classified)
-		}
-	}
-	return sources, failures
-}
-
-func (e *Engine) queueOmnigentContainerRetries() {
-	factory, ok := e.providerFactories[parser.AgentOmnigent]
-	if !ok || factory == nil {
-		return
-	}
-	roots := e.agentDirs[parser.AgentOmnigent]
-	if len(roots) == 0 {
-		return
-	}
-	provider := factory.NewProvider(parser.ProviderConfig{
-		Roots:   roots,
-		Machine: e.machine,
-	})
-	plan, err := provider.WatchPlan(context.Background())
-	if err != nil {
-		log.Printf("%s provider abort recovery watch plan: %v", parser.AgentOmnigent, err)
-		return
-	}
-	for _, root := range plan.Roots {
-		for _, include := range root.IncludeGlobs {
-			if include == "" || strings.ContainsAny(include, `*?[\`) {
-				continue
-			}
-			path := filepath.Join(root.Path, include)
-			if parser.IsRegularFile(path) {
-				e.markOmnigentSourceRetry(parser.AgentOmnigent, path)
-			}
-		}
-	}
 }
 
 func (e *Engine) visualStudioCopilotMissingVS2026PollSources(
@@ -4312,12 +4020,12 @@ func (e *Engine) collectAndBatch(
 			// ctx.Done() branch above.
 			if ctx.Err() != nil {
 				stats.Aborted = true
-				e.markOmnigentSourceRetry(r.agent, r.path)
+				e.markContainerSourceRetry(r.agent, r.path)
 				e.drainCanceledResults(results, total-i-1)
 				goto flush
 			}
 			stats.RecordFailed()
-			e.markOmnigentSourceRetry(r.agent, r.path)
+			e.markContainerSourceRetry(r.agent, r.path)
 			e.noteSQLiteContainerResult(r.path, false)
 			if r.cacheSkip && r.mtime != 0 && !r.noCacheSkip {
 				e.cacheSkip(r.skipCacheKey(), r.mtime, r.sourceFingerprint)
@@ -4330,7 +4038,7 @@ func (e *Engine) collectAndBatch(
 				e.cacheSkip(r.skipCacheKey(), r.mtime)
 			}
 			stats.RecordSkip()
-			e.clearOmnigentSourceRetry(r.agent, r.path)
+			e.clearContainerSourceRetry(r.agent, r.path)
 			e.noteSQLiteContainerResult(r.path, true)
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
@@ -4355,7 +4063,7 @@ func (e *Engine) collectAndBatch(
 			); err != nil {
 				log.Printf("delete parser-excluded sessions: %v", err)
 				stats.RecordFailed()
-				e.markOmnigentSourceRetry(r.agent, r.path)
+				e.markContainerSourceRetry(r.agent, r.path)
 				e.noteSQLiteContainerResult(r.path, false)
 				continue
 			}
@@ -4364,7 +4072,7 @@ func (e *Engine) collectAndBatch(
 				excludedSessionIDs...,
 			)
 		}
-		e.clearOmnigentSourceRetry(r.agent, r.path)
+		e.clearContainerSourceRetry(r.agent, r.path)
 		if len(r.results) == 0 && r.incremental == nil {
 			if len(r.excludedSessionIDs) > 0 {
 				stats.filesOK++
@@ -4402,7 +4110,7 @@ func (e *Engine) collectAndBatch(
 			r.path, vetoed == 0 && len(r.retrySessionIDs) == 0,
 		)
 		if vetoed > 0 && len(allowed) == 0 {
-			e.clearOmnigentSourceRetry(r.agent, r.path)
+			e.clearContainerSourceRetry(r.agent, r.path)
 			stats.cwdFilteredFiles++
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
@@ -4522,11 +4230,11 @@ flush:
 }
 
 // drainCanceledResults consumes remaining items so workers can exit while
-// preserving Omnigent sources whose parse-side tracker changes were discarded.
+// preserving container sources whose parse-side tracker changes were discarded.
 func (e *Engine) drainCanceledResults(results <-chan syncJob, remaining int) {
 	for range remaining {
 		r := <-results
-		e.markOmnigentSourceRetry(r.agent, r.path)
+		e.markContainerSourceRetry(r.agent, r.path)
 	}
 }
 
@@ -4878,7 +4586,8 @@ func (e *Engine) processProviderFile(
 	// parse entirely. This reproduces the legacy process arm's
 	// shouldSkipFile gate so an unchanged session is not re-parsed on
 	// every full sync.
-	sourceForceReplace := file.Agent == parser.AgentOmnigent && file.ForceParse
+	_, containerScheduled := e.containerSchedulers[file.Agent]
+	sourceForceReplace := containerScheduled && file.ForceParse
 	if mtime, fresh, forceReplace, contentVerified := e.providerSingleSessionFresh(
 		ctx, provider, source, file,
 	); fresh {
@@ -5037,9 +4746,10 @@ func (e *Engine) processProviderFile(
 			noCacheSkip: true,
 		}, true
 	}
-	if parser.IsOmnigentContainerSource(source) &&
+	if scheduler, ok := e.containerSchedulers[file.Agent]; ok &&
+		scheduler.IsContainerSource(source) &&
 		outcome.SkipReason != parser.SkipUnsupportedSource {
-		e.resyncOmnigentAdvanced.Store(true)
+		e.resyncContainerAdvanced.Store(true)
 	}
 	if err := validateProviderOutcome(
 		provider.Definition(),
@@ -5096,12 +4806,13 @@ func (e *Engine) processProviderFile(
 		forceReplace:          outcome.ForceReplace || incForceReplace,
 		suppressPresenceSweep: !outcome.ResultSetComplete,
 	}
-	if file.Agent == parser.AgentOmnigent && cacheSkip && cleanCache &&
+	if scheduler, ok := e.containerSchedulers[file.Agent]; ok &&
+		cacheSkip && cleanCache &&
 		!e.forceParse && !file.ForceParse &&
 		outcome.ResultSetComplete && len(outcome.SourceErrors) == 0 &&
 		fingerprint.Hash != "" {
 		path := providerDiscoveredPath(source)
-		_, _, virtual := parser.ParseOmnigentVirtualSourcePath(path)
+		_, _, virtual := scheduler.SplitContainerMemberPath(path)
 		res.cacheAfterWrite = !virtual
 	}
 	// Incremental-append providers (Claude and Codex) need the stored file
@@ -7232,238 +6943,6 @@ type pendingWrite struct {
 	storageTrustSnap  storageTrustSnapshot
 }
 
-type omnigentRetrySource struct {
-	sessionID string
-	filePath  string
-	recovery  bool
-}
-
-type omnigentRetryEntry struct {
-	omnigentRetrySource
-	container  string
-	reactivate bool
-	prev       *omnigentRetryEntry
-	next       *omnigentRetryEntry
-}
-
-func (r omnigentRetrySource) key() string {
-	if r.recovery {
-		return "recovery\x00" + filepath.Clean(r.filePath)
-	}
-	if r.sessionID != "" {
-		return "session\x00" + r.sessionID
-	}
-	return "source\x00" + filepath.Clean(r.filePath)
-}
-
-func (e *Engine) markOmnigentSourceRetry(agent parser.AgentType, path string) {
-	if agent != parser.AgentOmnigent {
-		return
-	}
-	_, memberID, virtual := parser.ParseOmnigentVirtualSourcePath(path)
-	retry := omnigentRetrySource{filePath: path}
-	if virtual && memberID != "" {
-		retry.sessionID = string(parser.AgentOmnigent) + ":" + memberID
-	}
-	e.storeOmnigentRetry(retry)
-}
-
-func (e *Engine) markOmnigentSessionRetry(pw pendingWrite) {
-	if pw.sess.Agent != parser.AgentOmnigent || pw.sess.ID == "" ||
-		pw.sess.File.Path == "" {
-		return
-	}
-	staleVersion := max(db.CurrentDataVersion()-1, 0)
-	if e.db.GetSessionDataVersion(pw.sess.ID) > staleVersion {
-		if err := e.db.SetSessionDataVersion(pw.sess.ID, staleVersion); err != nil {
-			log.Printf("mark omnigent retry stale for %s: %v", pw.sess.ID, err)
-		}
-	}
-	e.storeOmnigentRetry(omnigentRetrySource{
-		sessionID: pw.sess.ID,
-		filePath:  pw.sess.File.Path,
-	})
-}
-
-func (e *Engine) storeOmnigentRetry(retry omnigentRetrySource) {
-	e.omnigentRetryMu.Lock()
-	if e.omnigentRetrySources == nil {
-		e.omnigentRetrySources = make(map[string]*omnigentRetryEntry)
-	}
-	if e.omnigentRetryContainers == nil {
-		e.omnigentRetryContainers = make(map[string]map[string]struct{})
-	}
-	activateRoot := e.storeOmnigentRetryLocked(retry)
-	e.omnigentRetryMu.Unlock()
-	if activateRoot != "" {
-		e.activateOmnigentStoredHintSweep(activateRoot)
-	}
-}
-
-func (e *Engine) storeOmnigentRetryLocked(retry omnigentRetrySource) string {
-	key := retry.key()
-	if _, exists := e.omnigentRetrySources[key]; exists {
-		return ""
-	}
-	container, member := omnigentRetryContainer(retry.filePath)
-	containerKey := omnigentRetrySource{filePath: container}.key()
-	recoveryKey := omnigentRetrySource{filePath: container, recovery: true}.key()
-	if member {
-		if _, recoveringContainer := e.omnigentRetrySources[containerKey]; recoveringContainer {
-			return ""
-		}
-		if recovery := e.omnigentRetrySources[recoveryKey]; recovery != nil {
-			recovery.reactivate = true
-			return ""
-		}
-	} else if container != "" {
-		e.collapseOmnigentRetryContainerLocked(container)
-	}
-
-	entry := &omnigentRetryEntry{
-		omnigentRetrySource: retry,
-		container:           container,
-	}
-	e.omnigentRetrySources[key] = entry
-	e.appendOmnigentRetryLocked(entry)
-	if container != "" {
-		bucket := e.omnigentRetryContainers[container]
-		if bucket == nil {
-			bucket = make(map[string]struct{})
-			e.omnigentRetryContainers[container] = bucket
-		}
-		bucket[key] = struct{}{}
-		if member && len(bucket) >= omnigentRetryBatchSize {
-			e.collapseOmnigentRetryContainerLocked(container)
-			e.storeOmnigentRetryLocked(omnigentRetrySource{
-				filePath: container,
-				recovery: true,
-			})
-			return filepath.Dir(container)
-		}
-	}
-	return ""
-}
-
-func (e *Engine) activateOmnigentStoredHintSweep(watchRoot string) {
-	key := string(parser.AgentOmnigent) + "\x00" + filepath.Clean(watchRoot)
-	e.omnigentHintMu.Lock()
-	defer e.omnigentHintMu.Unlock()
-	if e.omnigentHintCursors == nil {
-		e.omnigentHintCursors = make(map[string]omnigentHintCursor)
-	}
-	cursor := e.omnigentHintCursors[key]
-	if cursor.active {
-		cursor.reactivate = true
-	} else {
-		cursor.active = true
-		cursor.after = ""
-	}
-	e.omnigentHintCursors[key] = cursor
-}
-
-func (e *Engine) omnigentStoredHintSweepActive(watchRoots []string) bool {
-	e.omnigentHintMu.Lock()
-	defer e.omnigentHintMu.Unlock()
-	for _, watchRoot := range watchRoots {
-		key := string(parser.AgentOmnigent) + "\x00" + filepath.Clean(watchRoot)
-		if e.omnigentHintCursors[key].active {
-			return true
-		}
-	}
-	return false
-}
-
-func omnigentRetryContainer(path string) (string, bool) {
-	if container, _, virtual := parser.ParseOmnigentVirtualSourcePath(path); virtual {
-		return filepath.Clean(container), true
-	}
-	path = filepath.Clean(path)
-	if path == "" || path == "." {
-		return "", false
-	}
-	return path, false
-}
-
-func (e *Engine) appendOmnigentRetryLocked(entry *omnigentRetryEntry) {
-	entry.prev = e.omnigentRetryTail
-	entry.next = nil
-	if e.omnigentRetryTail != nil {
-		e.omnigentRetryTail.next = entry
-	} else {
-		e.omnigentRetryHead = entry
-	}
-	e.omnigentRetryTail = entry
-}
-
-func (e *Engine) moveOmnigentRetryToTailLocked(entry *omnigentRetryEntry) {
-	if entry == nil || entry == e.omnigentRetryTail {
-		return
-	}
-	if entry.prev != nil {
-		entry.prev.next = entry.next
-	} else {
-		e.omnigentRetryHead = entry.next
-	}
-	entry.next.prev = entry.prev
-	e.appendOmnigentRetryLocked(entry)
-}
-
-func (e *Engine) collapseOmnigentRetryContainerLocked(container string) {
-	for key := range e.omnigentRetryContainers[container] {
-		e.removeOmnigentRetryLocked(key)
-	}
-}
-
-func (e *Engine) removeOmnigentRetryLocked(key string) {
-	entry, exists := e.omnigentRetrySources[key]
-	if !exists {
-		return
-	}
-	if entry.prev != nil {
-		entry.prev.next = entry.next
-	} else {
-		e.omnigentRetryHead = entry.next
-	}
-	if entry.next != nil {
-		entry.next.prev = entry.prev
-	} else {
-		e.omnigentRetryTail = entry.prev
-	}
-	delete(e.omnigentRetrySources, key)
-	if bucket := e.omnigentRetryContainers[entry.container]; bucket != nil {
-		delete(bucket, key)
-		if len(bucket) == 0 {
-			delete(e.omnigentRetryContainers, entry.container)
-		}
-	}
-}
-
-func (e *Engine) clearOmnigentSessionRetry(pw pendingWrite) {
-	if pw.sess.Agent != parser.AgentOmnigent || pw.sess.ID == "" {
-		return
-	}
-	e.omnigentRetryMu.Lock()
-	e.removeOmnigentRetryLocked(omnigentRetrySource{
-		sessionID: pw.sess.ID,
-	}.key())
-	e.omnigentRetryMu.Unlock()
-}
-
-func (e *Engine) clearOmnigentSourceRetry(agent parser.AgentType, path string) {
-	if agent != parser.AgentOmnigent || path == "" {
-		return
-	}
-	_, memberID, virtual := parser.ParseOmnigentVirtualSourcePath(path)
-	retry := omnigentRetrySource{filePath: path}
-	if virtual && memberID != "" {
-		retry.sessionID = string(parser.AgentOmnigent) + ":" + memberID
-	}
-	e.omnigentRetryMu.Lock()
-	e.removeOmnigentRetryLocked(retry.key())
-	e.omnigentRetryMu.Unlock()
-}
-
 type skipCacheWrite struct {
 	key               string
 	mtime             int64
@@ -7574,7 +7053,7 @@ func (e *Engine) writeBatch(
 				continue
 			}
 			log.Printf("upsert session %s: %v", s.ID, err)
-			e.markOmnigentSessionRetry(pw)
+			e.markContainerSessionRetry(pw)
 			failedSessions++
 			continue
 		}
@@ -7604,7 +7083,7 @@ func (e *Engine) writeBatch(
 				"write messages for %s: %v",
 				s.ID, werr,
 			)
-			e.markOmnigentSessionRetry(pw)
+			e.markContainerSessionRetry(pw)
 			failedSessions++
 			continue
 		}
@@ -7615,7 +7094,7 @@ func (e *Engine) writeBatch(
 				"write usage events for %s: %v",
 				s.ID, err,
 			)
-			e.markOmnigentSessionRetry(pw)
+			e.markContainerSessionRetry(pw)
 			failedSessions++
 			continue
 		}
@@ -7631,11 +7110,11 @@ func (e *Engine) writeBatch(
 			log.Printf(
 				"set data_version for %s: %v", s.ID, err,
 			)
-			e.markOmnigentSessionRetry(pw)
+			e.markContainerSessionRetry(pw)
 			failedSessions++
 			continue
 		}
-		e.clearOmnigentSessionRetry(pw)
+		e.clearContainerSessionRetry(pw)
 
 		if !replaceMessages {
 			// Same ordering contract as recomputeSignalsFromDB: the
@@ -8541,7 +8020,7 @@ func (e *Engine) writeBatchBulk(
 	if err != nil {
 		log.Printf("write session batch: %v", err)
 		for _, pw := range pendingByID {
-			e.markOmnigentSessionRetry(pw)
+			e.markContainerSessionRetry(pw)
 		}
 		return 0, 0, len(writes), cwdFiltered
 	}
@@ -8549,12 +8028,12 @@ func (e *Engine) writeBatchBulk(
 	for _, id := range result.FailedIDs {
 		failedIDs[id] = struct{}{}
 		if pw, ok := pendingByID[id]; ok {
-			e.markOmnigentSessionRetry(pw)
+			e.markContainerSessionRetry(pw)
 		}
 	}
 	for id, pw := range pendingByID {
 		if _, failed := failedIDs[id]; !failed {
-			e.clearOmnigentSessionRetry(pw)
+			e.clearContainerSessionRetry(pw)
 		}
 	}
 	for _, id := range result.ExcludedIDs {

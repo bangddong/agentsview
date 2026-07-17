@@ -31,6 +31,24 @@ func (f cancelAfterOmnigentParseFactory) Capabilities() parser.Capabilities {
 	return f.delegate.Capabilities()
 }
 
+// The delegate declares ContainerScheduling, so the decorator must forward
+// the ContainerScheduler implementation the capability promises.
+func (f cancelAfterOmnigentParseFactory) SplitContainerMemberPath(
+	path string,
+) (string, string, bool) {
+	return f.delegate.(parser.ContainerScheduler).SplitContainerMemberPath(path)
+}
+
+func (f cancelAfterOmnigentParseFactory) MemberSessionID(memberID string) string {
+	return f.delegate.(parser.ContainerScheduler).MemberSessionID(memberID)
+}
+
+func (f cancelAfterOmnigentParseFactory) IsContainerSource(
+	source parser.SourceRef,
+) bool {
+	return f.delegate.(parser.ContainerScheduler).IsContainerSource(source)
+}
+
 func (f cancelAfterOmnigentParseFactory) NewProvider(
 	cfg parser.ProviderConfig,
 ) parser.Provider {
@@ -58,6 +76,22 @@ func (f blockAfterOmnigentParseFactory) Definition() parser.AgentDef {
 
 func (f blockAfterOmnigentParseFactory) Capabilities() parser.Capabilities {
 	return f.delegate.Capabilities()
+}
+
+func (f blockAfterOmnigentParseFactory) SplitContainerMemberPath(
+	path string,
+) (string, string, bool) {
+	return f.delegate.(parser.ContainerScheduler).SplitContainerMemberPath(path)
+}
+
+func (f blockAfterOmnigentParseFactory) MemberSessionID(memberID string) string {
+	return f.delegate.(parser.ContainerScheduler).MemberSessionID(memberID)
+}
+
+func (f blockAfterOmnigentParseFactory) IsContainerSource(
+	source parser.SourceRef,
+) bool {
+	return f.delegate.(parser.ContainerScheduler).IsContainerSource(source)
 }
 
 func (f blockAfterOmnigentParseFactory) NewProvider(
@@ -216,9 +250,9 @@ func TestResyncPreparationFailureDoesNotQueueOmnigentContainer(t *testing.T) {
 	engine.syncMu.Unlock()
 	require.Error(t, err)
 	assert.True(t, stats.Aborted)
-	engine.omnigentRetryMu.Lock()
-	retryCount := len(engine.omnigentRetrySources)
-	engine.omnigentRetryMu.Unlock()
+	engine.containerRetryMu.Lock()
+	retryCount := len(engine.containerRetrySources)
+	engine.containerRetryMu.Unlock()
 	assert.Zero(t, retryCount,
 		"preparation failure cannot have advanced the provider tracker")
 }
@@ -244,9 +278,9 @@ func TestCanceledResyncBeforeOmnigentParseDoesNotQueueContainer(t *testing.T) {
 	engine.syncMu.Unlock()
 	require.ErrorIs(t, err, context.Canceled)
 	assert.True(t, stats.Aborted)
-	engine.omnigentRetryMu.Lock()
-	retryCount := len(engine.omnigentRetrySources)
-	engine.omnigentRetryMu.Unlock()
+	engine.containerRetryMu.Lock()
+	retryCount := len(engine.containerRetrySources)
+	engine.containerRetryMu.Unlock()
 	assert.Zero(t, retryCount,
 		"cancellation before container parse must not force a later full parse")
 }
@@ -300,9 +334,9 @@ func TestCanceledResyncAfterEmptyOmnigentParseQueuesHashPathContainer(t *testing
 	engine.syncMu.Unlock()
 	require.ErrorIs(t, err, context.Canceled)
 	assert.True(t, stats.Aborted)
-	engine.omnigentRetryMu.Lock()
-	retryCount := len(engine.omnigentRetrySources)
-	engine.omnigentRetryMu.Unlock()
+	engine.containerRetryMu.Lock()
+	retryCount := len(engine.containerRetrySources)
+	engine.containerRetryMu.Unlock()
 	assert.Equal(t, 1, retryCount,
 		"discarding an empty parsed container must queue it for the live archive")
 	stored, err := archive.GetSession(context.Background(), "omnigent:conversation")
@@ -346,9 +380,9 @@ func TestCanceledFullSyncQueuesDiscardedOmnigentContainer(t *testing.T) {
 	close(release)
 	stats := <-done
 	assert.True(t, stats.Aborted)
-	engine.omnigentRetryMu.Lock()
-	retryCount := len(engine.omnigentRetrySources)
-	engine.omnigentRetryMu.Unlock()
+	engine.containerRetryMu.Lock()
+	retryCount := len(engine.containerRetrySources)
+	engine.containerRetryMu.Unlock()
 	assert.Equal(t, 1, retryCount)
 
 	recovered := engine.SyncAll(context.Background(), nil)
@@ -404,9 +438,9 @@ func TestCanceledChangedPathQueuesDiscardedOmnigentMember(t *testing.T) {
 	close(release)
 	<-done
 	assert.True(t, engine.LastSyncStats().Aborted)
-	engine.omnigentRetryMu.Lock()
-	retryCount := len(engine.omnigentRetrySources)
-	engine.omnigentRetryMu.Unlock()
+	engine.containerRetryMu.Lock()
+	retryCount := len(engine.containerRetrySources)
+	engine.containerRetryMu.Unlock()
 	assert.Equal(t, 1, retryCount)
 
 	recovered := engine.SyncAll(context.Background(), nil)

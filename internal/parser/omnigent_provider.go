@@ -21,6 +21,31 @@ const (
 	omnigentProbeBatchSize       = omnigentChangedBatchSize
 )
 
+// omnigentTrackedContainer is one container's change-tracking state. Its
+// fields form three bounded cursors plus a recovery overlay, each advancing
+// one batch per changedMembers call so no event materializes the whole
+// database:
+//
+//   - Initial scan (initializing, initialScanRowID): a cold or
+//     schema-changed container is enumerated by rowid pages until a short
+//     page ends the scan. While initializing, no other cursor runs.
+//   - Fast window (checkedAt, fastThrough, fastUpdatedAt, fastRowID,
+//     fastActive): the steady-state cursor. Each sweep fixes an updated_at
+//     window (checkedAt-1, fastThrough] at activation and drains it in
+//     keyset-ordered (updated_at, rowid) pages; a short page closes the
+//     window and advances checkedAt to its end.
+//   - Probe (compositeMTimeNS, probeRowID, probeActive, probeRepeat): a
+//     composite db/-wal/-shm mtime change or explicit watcher event starts a
+//     full rowid re-enumeration to catch rows whose updated_at did not move.
+//     probeRepeat coalesces changes observed mid-probe into one restart.
+//   - Recovery (recovering, recoveryBoundary): an initial scan re-run for
+//     the engine's ChangedPathEventRecovery, sharing the initial-scan
+//     cursor. recoveryBoundary absorbs exactly one follow-up recovery event
+//     when the scan ended on a full page, so the engine's retry entry drains
+//     without restarting the sweep.
+//
+// The zero value is a cold container. Detected schema changes reset the
+// container to a fresh initial scan.
 type omnigentTrackedContainer struct {
 	schema           omnigentSchema
 	initializing     bool
@@ -38,6 +63,10 @@ type omnigentTrackedContainer struct {
 	probeRepeat      bool
 }
 
+// omnigentChangeTracker owns per-container change cursors for one factory
+// lifetime. recoveryPending marks containers whose recovery initialization is
+// in flight, so ordinary events observed meanwhile return nothing instead of
+// racing the recovery scan.
 type omnigentChangeTracker struct {
 	mu              sync.Mutex
 	containers      map[string]omnigentTrackedContainer
@@ -57,7 +86,7 @@ func newOmnigentChangeTracker() *omnigentChangeTracker {
 // batch may use one whole-container source for authoritative reconciliation.
 func newOmnigentProviderFactory(def AgentDef) ProviderFactory {
 	tracker := newOmnigentChangeTracker()
-	return NewMultiSessionProviderFactory(
+	return omnigentProviderFactory{NewMultiSessionProviderFactory(
 		def,
 		omnigentProviderCapabilities(),
 		func(cfg ProviderConfig) multiSessionContainerSourceSet {
@@ -80,7 +109,27 @@ func newOmnigentProviderFactory(def AgentDef) ProviderFactory {
 				WithExcludedSessionIDs(omnigentLegacySessionIDs),
 			)
 		},
-	)
+	)}
+}
+
+// omnigentProviderFactory implements ContainerScheduler for the engine's
+// shared-container scheduling declared by Source.ContainerScheduling.
+type omnigentProviderFactory struct {
+	ProviderFactory
+}
+
+func (omnigentProviderFactory) SplitContainerMemberPath(
+	path string,
+) (string, string, bool) {
+	return parseOmnigentVirtualPath(path)
+}
+
+func (omnigentProviderFactory) MemberSessionID(memberID string) string {
+	return omnigentIDPrefix + memberID
+}
+
+func (omnigentProviderFactory) IsContainerSource(source SourceRef) bool {
+	return IsOmnigentContainerSource(source)
 }
 
 // IsOmnigentContainerSource reports whether source addresses the whole
@@ -118,11 +167,13 @@ func omnigentLegacySessionIDs(
 }
 
 func omnigentProviderCapabilities() Capabilities {
+	source := multiSessionContainerSourceCapabilities(
+		CapabilitySupported,
+		CapabilitySupported,
+	)
+	source.ContainerScheduling = CapabilitySupported
 	return Capabilities{
-		Source: multiSessionContainerSourceCapabilities(
-			CapabilitySupported,
-			CapabilitySupported,
-		),
+		Source: source,
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
 			SessionName:          CapabilitySupported,

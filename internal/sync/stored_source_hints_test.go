@@ -19,6 +19,21 @@ import (
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
+func omnigentTestScheduler(t *testing.T) parser.ContainerScheduler {
+	t.Helper()
+	factory, ok := parser.ProviderFactoryByType(parser.AgentOmnigent)
+	require.True(t, ok)
+	scheduler, ok := parser.ContainerSchedulerForFactory(factory)
+	require.True(t, ok)
+	return scheduler
+}
+
+func omnigentTestSchedulers(t *testing.T) map[parser.AgentType]parser.ContainerScheduler {
+	return map[parser.AgentType]parser.ContainerScheduler{
+		parser.AgentOmnigent: omnigentTestScheduler(t),
+	}
+}
+
 type hintRecordingFactory struct {
 	agent parser.AgentType
 	caps  parser.Capabilities
@@ -168,6 +183,7 @@ func TestOmnigentChangedPathClaimsHintsOnlyForOwningWatchRoot(t *testing.T) {
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentOmnigent: parser.ProviderMigrationProviderAuthoritative,
 		},
+		containerSchedulers: omnigentTestSchedulers(t),
 	}
 
 	files := engine.classifyProviderChangedPath(changedPath)
@@ -175,9 +191,9 @@ func TestOmnigentChangedPathClaimsHintsOnlyForOwningWatchRoot(t *testing.T) {
 	require.Len(t, files, 1)
 	require.Equal(t, [][]string{{pathA}}, seen)
 	unrelatedKey := string(parser.AgentOmnigent) + "\x00" + filepath.Clean(rootB)
-	engine.omnigentHintMu.Lock()
-	_, unrelatedActivated := engine.omnigentHintCursors[unrelatedKey]
-	engine.omnigentHintMu.Unlock()
+	engine.containerHintMu.Lock()
+	_, unrelatedActivated := engine.containerHintCursors[unrelatedKey]
+	engine.containerHintMu.Unlock()
 	assert.False(t, unrelatedActivated,
 		"the event must not consume the unrelated root's archived hints")
 }
@@ -185,14 +201,14 @@ func TestOmnigentChangedPathClaimsHintsOnlyForOwningWatchRoot(t *testing.T) {
 func TestOmnigentStoredHintCursorSerializesConcurrentPages(t *testing.T) {
 	root := t.TempDir()
 	database := dbtest.OpenTestDB(t)
-	for i := range 2 * omnigentStoredHintBatchSize {
+	for i := range 2 * containerStoredHintBatchSize {
 		path := filepath.Join(root, fmt.Sprintf("chat.db#member-%03d", i))
 		require.NoError(t, database.UpsertSession(db.Session{
 			ID: fmt.Sprintf("omnigent:member-%03d", i), Agent: string(parser.AgentOmnigent),
 			Project: "fixture", Machine: "local", FilePath: strPtr(path),
 		}))
 	}
-	engine := &Engine{db: database}
+	engine := &Engine{db: database, containerSchedulers: omnigentTestSchedulers(t)}
 	type pageResult struct {
 		paths []string
 		err   error
@@ -206,7 +222,7 @@ func TestOmnigentStoredHintCursorSerializesConcurrentPages(t *testing.T) {
 					parser.AgentOmnigent, root,
 				)
 				if err != nil || claimed {
-					engine.finishOmnigentStoredHintPage(root, err == nil)
+					engine.finishContainerStoredHintPage(parser.AgentOmnigent, root, err == nil)
 					results <- pageResult{paths: paths, err: err}
 					return
 				}
@@ -217,17 +233,17 @@ func TestOmnigentStoredHintCursorSerializesConcurrentPages(t *testing.T) {
 	wg.Wait()
 	close(results)
 
-	seen := make(map[string]struct{}, 2*omnigentStoredHintBatchSize)
+	seen := make(map[string]struct{}, 2*containerStoredHintBatchSize)
 	for result := range results {
 		require.NoError(t, result.err)
-		require.Len(t, result.paths, omnigentStoredHintBatchSize)
+		require.Len(t, result.paths, containerStoredHintBatchSize)
 		for _, path := range result.paths {
 			_, duplicate := seen[path]
 			assert.False(t, duplicate, "concurrent page claims must not overlap")
 			seen[path] = struct{}{}
 		}
 	}
-	assert.Len(t, seen, 2*omnigentStoredHintBatchSize)
+	assert.Len(t, seen, 2*containerStoredHintBatchSize)
 }
 
 func TestOmnigentStoredHintPageRetriesFailureAndDeactivatesAfterCompletion(t *testing.T) {
@@ -238,24 +254,24 @@ func TestOmnigentStoredHintPageRetriesFailureAndDeactivatesAfterCompletion(t *te
 		ID: "omnigent:member", Agent: string(parser.AgentOmnigent),
 		Project: "fixture", Machine: "local", FilePath: strPtr(path),
 	}))
-	engine := &Engine{db: database}
+	engine := &Engine{db: database, containerSchedulers: omnigentTestSchedulers(t)}
 
 	first, claimed, err := engine.changedPathStoredSourcePaths(parser.AgentOmnigent, root)
 	require.NoError(t, err)
 	require.True(t, claimed)
 	require.Equal(t, []string{path}, first)
-	engine.finishOmnigentStoredHintPage(root, false)
+	engine.finishContainerStoredHintPage(parser.AgentOmnigent, root, false)
 
-	retry, claimed, err := engine.nextOmnigentStoredHintPage(
-		root, false, omnigentStoredHintBatchSize,
+	retry, claimed, err := engine.nextContainerStoredHintPage(parser.AgentOmnigent,
+		root, false, containerStoredHintBatchSize,
 	)
 	require.NoError(t, err)
 	require.True(t, claimed)
 	assert.Equal(t, first, retry)
-	engine.finishOmnigentStoredHintPage(root, true)
+	engine.finishContainerStoredHintPage(parser.AgentOmnigent, root, true)
 
-	remaining, claimed, err := engine.nextOmnigentStoredHintPage(
-		root, false, omnigentStoredHintBatchSize,
+	remaining, claimed, err := engine.nextContainerStoredHintPage(parser.AgentOmnigent,
+		root, false, containerStoredHintBatchSize,
 	)
 	require.NoError(t, err)
 	assert.False(t, claimed)
@@ -265,7 +281,7 @@ func TestOmnigentStoredHintPageRetriesFailureAndDeactivatesAfterCompletion(t *te
 func TestOmnigentStoredHintActivationSurvivesInitialQueryFailure(t *testing.T) {
 	root := t.TempDir()
 	database := dbtest.OpenTestDB(t)
-	engine := &Engine{db: database}
+	engine := &Engine{db: database, containerSchedulers: omnigentTestSchedulers(t)}
 	require.NoError(t, database.Close())
 
 	paths, claimed, err := engine.changedPathStoredSourcePaths(parser.AgentOmnigent, root)
@@ -274,9 +290,9 @@ func TestOmnigentStoredHintActivationSurvivesInitialQueryFailure(t *testing.T) {
 	assert.Empty(t, paths)
 
 	key := string(parser.AgentOmnigent) + "\x00" + filepath.Clean(root)
-	engine.omnigentHintMu.Lock()
-	cursor := engine.omnigentHintCursors[key]
-	engine.omnigentHintMu.Unlock()
+	engine.containerHintMu.Lock()
+	cursor := engine.containerHintCursors[key]
+	engine.containerHintMu.Unlock()
 	assert.True(t, cursor.active)
 	assert.False(t, cursor.inFlight)
 }
@@ -289,7 +305,7 @@ func TestOmnigentStoredHintActivationDuringFinalPageRestartsSweep(t *testing.T) 
 		ID: "omnigent:member", Agent: string(parser.AgentOmnigent),
 		Project: "fixture", Machine: "local", FilePath: strPtr(path),
 	}))
-	engine := &Engine{db: database}
+	engine := &Engine{db: database, containerSchedulers: omnigentTestSchedulers(t)}
 
 	first, claimed, err := engine.changedPathStoredSourcePaths(parser.AgentOmnigent, root)
 	require.NoError(t, err)
@@ -302,18 +318,18 @@ func TestOmnigentStoredHintActivationDuringFinalPageRestartsSweep(t *testing.T) 
 	require.NoError(t, err)
 	assert.False(t, claimed)
 	assert.Empty(t, concurrent)
-	engine.finishOmnigentStoredHintPage(root, true)
+	engine.finishContainerStoredHintPage(parser.AgentOmnigent, root, true)
 
-	restarted, claimed, err := engine.nextOmnigentStoredHintPage(
-		root, false, omnigentStoredHintBatchSize,
+	restarted, claimed, err := engine.nextContainerStoredHintPage(parser.AgentOmnigent,
+		root, false, containerStoredHintBatchSize,
 	)
 	require.NoError(t, err)
 	require.True(t, claimed)
 	assert.Equal(t, first, restarted)
-	engine.finishOmnigentStoredHintPage(root, true)
+	engine.finishContainerStoredHintPage(parser.AgentOmnigent, root, true)
 
-	remaining, claimed, err := engine.nextOmnigentStoredHintPage(
-		root, false, omnigentStoredHintBatchSize,
+	remaining, claimed, err := engine.nextContainerStoredHintPage(parser.AgentOmnigent,
+		root, false, containerStoredHintBatchSize,
 	)
 	require.NoError(t, err)
 	assert.False(t, claimed)
@@ -321,9 +337,11 @@ func TestOmnigentStoredHintActivationDuringFinalPageRestartsSweep(t *testing.T) 
 }
 
 func TestOmnigentRetryDiscoveryProcessesBoundedRotatingPages(t *testing.T) {
-	engine := &Engine{}
-	for i := range 3 * omnigentRetryBatchSize {
-		engine.storeOmnigentRetry(omnigentRetrySource{
+	engine := &Engine{containerSchedulers: omnigentTestSchedulers(t)}
+	scheduler := omnigentTestScheduler(t)
+	for i := range 3 * containerRetryBatchSize {
+		engine.storeContainerRetry(scheduler, containerRetrySource{
+			agent:    parser.AgentOmnigent,
 			filePath: fmt.Sprintf("/retry/container-%03d.db", i),
 		})
 	}
@@ -331,19 +349,19 @@ func TestOmnigentRetryDiscoveryProcessesBoundedRotatingPages(t *testing.T) {
 		Def: parser.AgentDef{Type: parser.AgentOmnigent},
 	}}
 
-	first, failures := engine.discoverOmnigentRetrySources(
-		context.Background(), provider, map[string]struct{}{},
+	first, failures := engine.discoverContainerRetrySources(
+		context.Background(), parser.AgentOmnigent, provider, map[string]struct{}{},
 	)
 	require.Zero(t, failures)
-	require.Len(t, first, omnigentRetryBatchSize)
-	second, failures := engine.discoverOmnigentRetrySources(
-		context.Background(), provider, map[string]struct{}{},
+	require.Len(t, first, containerRetryBatchSize)
+	second, failures := engine.discoverContainerRetrySources(
+		context.Background(), parser.AgentOmnigent, provider, map[string]struct{}{},
 	)
 	require.Zero(t, failures)
-	require.Len(t, second, omnigentRetryBatchSize)
-	require.Len(t, provider.seen, 2*omnigentRetryBatchSize)
+	require.Len(t, second, containerRetryBatchSize)
+	require.Len(t, provider.seen, 2*containerRetryBatchSize)
 
-	seen := make(map[string]struct{}, 2*omnigentRetryBatchSize)
+	seen := make(map[string]struct{}, 2*containerRetryBatchSize)
 	for _, req := range provider.seen {
 		_, duplicate := seen[req.StoredFilePath]
 		assert.False(t, duplicate, "successive retry pages must advance")
@@ -352,9 +370,11 @@ func TestOmnigentRetryDiscoveryProcessesBoundedRotatingPages(t *testing.T) {
 }
 
 func TestOmnigentRetryDiscoveryDoesNotWrapShortQueue(t *testing.T) {
-	engine := &Engine{}
+	engine := &Engine{containerSchedulers: omnigentTestSchedulers(t)}
+	scheduler := omnigentTestScheduler(t)
 	for i := range 3 {
-		engine.storeOmnigentRetry(omnigentRetrySource{
+		engine.storeContainerRetry(scheduler, containerRetrySource{
+			agent:    parser.AgentOmnigent,
 			filePath: fmt.Sprintf("/retry/short-%03d.db", i),
 		})
 	}
@@ -362,8 +382,8 @@ func TestOmnigentRetryDiscoveryDoesNotWrapShortQueue(t *testing.T) {
 		Def: parser.AgentDef{Type: parser.AgentOmnigent},
 	}}
 
-	sources, failures := engine.discoverOmnigentRetrySources(
-		context.Background(), provider, map[string]struct{}{},
+	sources, failures := engine.discoverContainerRetrySources(
+		context.Background(), parser.AgentOmnigent, provider, map[string]struct{}{},
 	)
 	require.Zero(t, failures)
 	require.Len(t, sources, 3)
@@ -376,7 +396,7 @@ func TestOmnigentMemberRetryOverflowRecoversUnstoredMembersInBoundedPages(t *tes
 	memberIDs := []string{"conversation"}
 	writer, err := sql.Open("sqlite3", container)
 	require.NoError(t, err)
-	for i := 1; i < 2*omnigentRetryBatchSize+1; i++ {
+	for i := 1; i < 2*containerRetryBatchSize+1; i++ {
 		member := fmt.Sprintf("member-%03d", i)
 		memberIDs = append(memberIDs, member)
 		_, err = writer.Exec(`INSERT INTO conversations
@@ -388,34 +408,36 @@ func TestOmnigentMemberRetryOverflowRecoversUnstoredMembersInBoundedPages(t *tes
 	require.NoError(t, writer.Close())
 
 	database := dbtest.OpenTestDB(t)
-	engine := &Engine{db: database}
+	engine := &Engine{db: database, containerSchedulers: omnigentTestSchedulers(t)}
+	scheduler := omnigentTestScheduler(t)
 	missing, err := database.GetSession(context.Background(), "omnigent:conversation")
 	require.NoError(t, err)
 	require.Nil(t, missing, "the retry source must not depend on an archived row")
 	for _, member := range memberIDs {
 		path := parser.VirtualSourcePath(container, member)
-		engine.storeOmnigentRetry(omnigentRetrySource{
+		engine.storeContainerRetry(scheduler, containerRetrySource{
+			agent:     parser.AgentOmnigent,
 			sessionID: "omnigent:" + member,
 			filePath:  path,
 		})
 	}
 
-	engine.omnigentRetryMu.Lock()
-	require.Len(t, engine.omnigentRetrySources, 1)
-	require.NotNil(t, engine.omnigentRetryHead)
-	assert.True(t, engine.omnigentRetryHead.recovery)
-	assert.Equal(t, container, engine.omnigentRetryHead.filePath)
-	assert.Same(t, engine.omnigentRetryHead, engine.omnigentRetryTail)
-	engine.omnigentRetryMu.Unlock()
+	engine.containerRetryMu.Lock()
+	require.Len(t, engine.containerRetrySources, 1)
+	require.NotNil(t, engine.containerRetryHead)
+	assert.True(t, engine.containerRetryHead.recovery)
+	assert.Equal(t, container, engine.containerRetryHead.filePath)
+	assert.Same(t, engine.containerRetryHead, engine.containerRetryTail)
+	engine.containerRetryMu.Unlock()
 
 	factory, ok := parser.ProviderFactoryByType(parser.AgentOmnigent)
 	require.True(t, ok)
 	provider := factory.NewProvider(parser.ProviderConfig{Roots: []string{root}})
-	first, failures := engine.discoverOmnigentRetrySources(
-		context.Background(), provider, map[string]struct{}{},
+	first, failures := engine.discoverContainerRetrySources(
+		context.Background(), parser.AgentOmnigent, provider, map[string]struct{}{},
 	)
 	require.Zero(t, failures)
-	require.Len(t, first, omnigentRetryBatchSize)
+	require.Len(t, first, containerRetryBatchSize)
 	firstPaths := make([]string, 0, len(first))
 	for _, source := range first {
 		path := providerDiscoveredPath(source)
@@ -423,34 +445,35 @@ func TestOmnigentMemberRetryOverflowRecoversUnstoredMembersInBoundedPages(t *tes
 		_, member, virtual := parser.ParseOmnigentVirtualSourcePath(path)
 		assert.True(t, virtual)
 		assert.NotEmpty(t, member)
-		engine.storeOmnigentRetry(omnigentRetrySource{
+		engine.storeContainerRetry(scheduler, containerRetrySource{
+			agent:     parser.AgentOmnigent,
 			sessionID: "omnigent:" + member,
 			filePath:  path,
 		})
 	}
-	engine.omnigentRetryMu.Lock()
-	assert.Len(t, engine.omnigentRetrySources, 1,
+	engine.containerRetryMu.Lock()
+	assert.Len(t, engine.containerRetrySources, 1,
 		"failed early members must not restart or expand active recovery")
-	engine.omnigentRetryMu.Unlock()
-	second, failures := engine.discoverOmnigentRetrySources(
-		context.Background(), provider, map[string]struct{}{},
+	engine.containerRetryMu.Unlock()
+	second, failures := engine.discoverContainerRetrySources(
+		context.Background(), parser.AgentOmnigent, provider, map[string]struct{}{},
 	)
 	require.Zero(t, failures)
-	require.Len(t, second, omnigentRetryBatchSize)
-	last, failures := engine.discoverOmnigentRetrySources(
-		context.Background(), provider, map[string]struct{}{},
+	require.Len(t, second, containerRetryBatchSize)
+	last, failures := engine.discoverContainerRetrySources(
+		context.Background(), parser.AgentOmnigent, provider, map[string]struct{}{},
 	)
 	require.Zero(t, failures)
 	require.Len(t, last, 1)
-	engine.omnigentRetryMu.Lock()
-	require.Len(t, engine.omnigentRetrySources, 1)
-	assert.False(t, engine.omnigentRetryHead.reactivate)
-	engine.omnigentRetryMu.Unlock()
-	restarted, failures := engine.discoverOmnigentRetrySources(
-		context.Background(), provider, map[string]struct{}{},
+	engine.containerRetryMu.Lock()
+	require.Len(t, engine.containerRetrySources, 1)
+	assert.False(t, engine.containerRetryHead.reactivate)
+	engine.containerRetryMu.Unlock()
+	restarted, failures := engine.discoverContainerRetrySources(
+		context.Background(), parser.AgentOmnigent, provider, map[string]struct{}{},
 	)
 	require.Zero(t, failures)
-	require.Len(t, restarted, omnigentRetryBatchSize)
+	require.Len(t, restarted, containerRetryBatchSize)
 	restartedPaths := make([]string, 0, len(restarted))
 	for _, source := range restarted {
 		restartedPaths = append(restartedPaths, providerDiscoveredPath(source))

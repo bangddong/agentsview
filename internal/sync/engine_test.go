@@ -1266,7 +1266,7 @@ func TestWriteBatchBulkQueuesFailedOmnigentSession(t *testing.T) {
 		END`)
 	require.NoError(t, err)
 
-	e := &Engine{db: database}
+	e := &Engine{db: database, containerSchedulers: omnigentTestSchedulers(t)}
 	container := filepath.Join(t.TempDir(), "chat.db")
 	makeWrite := func(rawID string) pendingWrite {
 		return pendingWrite{sess: parser.ParsedSession{
@@ -1286,11 +1286,12 @@ func TestWriteBatchBulkQueuesFailedOmnigentSession(t *testing.T) {
 	assert.Equal(t, 1, written)
 	assert.Equal(t, 1, failed)
 
-	e.omnigentRetryMu.Lock()
-	retry, queued := e.omnigentRetrySources[omnigentRetrySource{
+	e.containerRetryMu.Lock()
+	retry, queued := e.containerRetrySources[containerRetrySource{
+		agent:     parser.AgentOmnigent,
 		sessionID: "omnigent:failed",
 	}.key()]
-	e.omnigentRetryMu.Unlock()
+	e.containerRetryMu.Unlock()
 	require.True(t, queued)
 	assert.Equal(t, parser.VirtualSourcePath(container, "failed"), retry.filePath)
 }

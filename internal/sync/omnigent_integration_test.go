@@ -37,6 +37,24 @@ func (f omnigentParseCountingFactory) Capabilities() parser.Capabilities {
 	return f.delegate.Capabilities()
 }
 
+// The delegate declares ContainerScheduling, so the decorator must forward
+// the ContainerScheduler implementation the capability promises.
+func (f omnigentParseCountingFactory) SplitContainerMemberPath(
+	path string,
+) (string, string, bool) {
+	return f.delegate.(parser.ContainerScheduler).SplitContainerMemberPath(path)
+}
+
+func (f omnigentParseCountingFactory) MemberSessionID(memberID string) string {
+	return f.delegate.(parser.ContainerScheduler).MemberSessionID(memberID)
+}
+
+func (f omnigentParseCountingFactory) IsContainerSource(
+	source parser.SourceRef,
+) bool {
+	return f.delegate.(parser.ContainerScheduler).IsContainerSource(source)
+}
+
 func (f omnigentParseCountingFactory) NewProvider(
 	cfg parser.ProviderConfig,
 ) parser.Provider {
