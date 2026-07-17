@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1254,50 +1255,62 @@ func TestWriteBatchRemoteIDPrefixUsageEvents(t *testing.T) {
 }
 
 func TestWriteBatchBulkDemotesFailedOmnigentSession(t *testing.T) {
-	database := openTestDB(t)
-	// Seed the session at the current data version, then fail its update:
-	// the demotion must mark the stored row stale, not leave it current.
-	require.NoError(t, database.UpsertSession(db.Session{
-		ID: "omnigent:failed", Agent: string(parser.AgentOmnigent),
-		Project: "project-a", Machine: "local",
-	}))
-	require.NoError(t, database.SetSessionDataVersion(
-		"omnigent:failed", db.CurrentDataVersion(),
-	))
-	raw, err := sql.Open("sqlite3", database.Path())
-	require.NoError(t, err)
-	defer raw.Close()
-	_, err = raw.Exec(`CREATE TRIGGER fail_omnigent_bulk_session
-		BEFORE INSERT ON sessions
-		WHEN NEW.id = 'omnigent:failed'
-		BEGIN
-			SELECT RAISE(FAIL, 'injected bulk failure');
-		END`)
-	require.NoError(t, err)
+	for _, tc := range []struct {
+		name     string
+		idPrefix string
+	}{
+		{name: "local"},
+		{name: "remote prefixed", idPrefix: "m2_"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database := openTestDB(t)
+			storedID := tc.idPrefix + "omnigent:failed"
+			// Seed the session at the current data version, then fail its
+			// update: the demotion must mark the stored row stale, not
+			// leave it current.
+			require.NoError(t, database.UpsertSession(db.Session{
+				ID: storedID, Agent: string(parser.AgentOmnigent),
+				Project: "project-a", Machine: "local",
+			}))
+			require.NoError(t, database.SetSessionDataVersion(
+				storedID, db.CurrentDataVersion(),
+			))
+			raw, err := sql.Open("sqlite3", database.Path())
+			require.NoError(t, err)
+			defer raw.Close()
+			_, err = raw.Exec(fmt.Sprintf(`CREATE TRIGGER fail_omnigent_bulk_session
+				BEFORE INSERT ON sessions
+				WHEN NEW.id = '%s'
+				BEGIN
+					SELECT RAISE(FAIL, 'injected bulk failure');
+				END`, storedID))
+			require.NoError(t, err)
 
-	e := &Engine{db: database}
-	container := filepath.Join(t.TempDir(), "chat.db")
-	makeWrite := func(rawID string) pendingWrite {
-		return pendingWrite{sess: parser.ParsedSession{
-			ID:        "omnigent:" + rawID,
-			Project:   "project-a",
-			Machine:   "local",
-			Agent:     parser.AgentOmnigent,
-			StartedAt: time.Unix(1_700_000_000, 0),
-			File: parser.FileInfo{
-				Path: parser.VirtualSourcePath(container, rawID),
-			},
-		}}
+			e := &Engine{db: database, idPrefix: tc.idPrefix}
+			container := filepath.Join(t.TempDir(), "chat.db")
+			makeWrite := func(rawID string) pendingWrite {
+				return pendingWrite{sess: parser.ParsedSession{
+					ID:        "omnigent:" + rawID,
+					Project:   "project-a",
+					Machine:   "local",
+					Agent:     parser.AgentOmnigent,
+					StartedAt: time.Unix(1_700_000_000, 0),
+					File: parser.FileInfo{
+						Path: parser.VirtualSourcePath(container, rawID),
+					},
+				}}
+			}
+			written, _, failed, _ := e.writeBatchBulk([]pendingWrite{
+				makeWrite("ok"), makeWrite("failed"),
+			}, true)
+			assert.Equal(t, 1, written)
+			assert.Equal(t, 1, failed)
+			assert.Less(t, database.GetSessionDataVersion(storedID),
+				db.CurrentDataVersion(),
+				"a failed member write must demote stored freshness so the "+
+					"next container parse rewrites it")
+		})
 	}
-	written, _, failed, _ := e.writeBatchBulk([]pendingWrite{
-		makeWrite("ok"), makeWrite("failed"),
-	}, true)
-	assert.Equal(t, 1, written)
-	assert.Equal(t, 1, failed)
-	assert.Less(t, database.GetSessionDataVersion("omnigent:failed"),
-		db.CurrentDataVersion(),
-		"a failed member write must demote stored freshness so the next "+
-			"container parse rewrites it")
 }
 
 func TestProjectIdentityWriteBatchDiscoversLocalGitRemote(t *testing.T) {

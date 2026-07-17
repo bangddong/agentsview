@@ -316,8 +316,8 @@ func (t *omnigentChangeTracker) changedMembers(
 	if err != nil {
 		return nil, err
 	}
-	storedMatches, err := omnigentStoredSourceMatches(
-		ctx, root, match.Container, schema, req.StoredSourcePaths,
+	tombstones, err := omnigentDeletedMemberTombstones(
+		ctx, conn, root, match.Container, schema, req.StoredSourcePaths,
 	)
 	if err != nil {
 		return nil, err
@@ -329,7 +329,7 @@ func (t *omnigentChangeTracker) changedMembers(
 	}
 	t.mu.Unlock()
 	return appendOmnigentMatches(
-		omnigentMatches(match.Container, schema, changed), storedMatches,
+		omnigentMatches(match.Container, schema, changed), tombstones,
 	), nil
 }
 
@@ -425,14 +425,17 @@ func appendOmnigentMatches(
 	return out
 }
 
-func omnigentStoredSourceMatches(
-	ctx context.Context, root, container string, schema omnigentSchema,
-	storedSourcePaths []string,
+// omnigentDeletedMemberTombstones emits a match for each stored member of the
+// changed container whose conversation row no longer exists, so an in-place
+// deletion is retired by the next sweep instead of waiting for the scheduled
+// full sync. Members still present are not re-emitted: one indexed ID scan on
+// the already-open connection replaces per-member existence probes, and the
+// fan-out stays bounded by the changed set plus actual deletions.
+func omnigentDeletedMemberTombstones(
+	ctx context.Context, conn *sql.DB, root, container string,
+	schema omnigentSchema, storedSourcePaths []string,
 ) ([]multiSessionMatch, error) {
-	if len(storedSourcePaths) == 0 {
-		return nil, nil
-	}
-	var matches []multiSessionMatch
+	var stored []multiSessionMatch
 	for _, storedPath := range storedSourcePaths {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -441,9 +444,46 @@ func omnigentStoredSourceMatches(
 		if !ok || match.MemberID == "" || !samePath(match.Container, container) {
 			continue
 		}
-		matches = append(matches, match)
+		stored = append(stored, match)
 	}
-	return matches, nil
+	if len(stored) == 0 {
+		return nil, nil
+	}
+	live, err := listOmnigentMemberKeys(ctx, conn, schema)
+	if err != nil {
+		return nil, err
+	}
+	var tombstones []multiSessionMatch
+	for _, match := range stored {
+		if _, present := live[match.MemberID]; present {
+			continue
+		}
+		tombstones = append(tombstones, match)
+	}
+	return tombstones, nil
+}
+
+func listOmnigentMemberKeys(
+	ctx context.Context, conn *sql.DB, schema omnigentSchema,
+) (map[string]struct{}, error) {
+	query := `SELECT 0, id FROM conversations`
+	if schema.splitMetadata {
+		query = `SELECT workspace_id, id FROM conversations`
+	}
+	rows, err := conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("listing omnigent member keys: %w", err)
+	}
+	defer rows.Close()
+	keys := make(map[string]struct{})
+	for rows.Next() {
+		var member omnigentMemberID
+		if err := rows.Scan(&member.workspaceID, &member.rawID); err != nil {
+			return nil, fmt.Errorf("scanning omnigent member key: %w", err)
+		}
+		keys[member.key(schema)] = struct{}{}
+	}
+	return keys, rows.Err()
 }
 
 func (t *omnigentChangeTracker) parseContainer(

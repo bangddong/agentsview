@@ -622,7 +622,7 @@ func TestSyncOmnigentFallbackUsageAppearsInAnalytics(t *testing.T) {
 	assert.InDelta(t, 0.25, daily.Daily[0].TotalCost, 0.0001)
 }
 
-func TestSyncPathsOmnigentSameTimestampAppendUsesMemberHash(t *testing.T) {
+func TestSyncOmnigentSameTimestampAppendIsReconciledByFullSync(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -652,12 +652,28 @@ func TestSyncPathsOmnigentSameTimestampAppendUsesMemberHash(t *testing.T) {
 	require.Equal(t, beforeInfo.Size(), afterInfo.Size(),
 		"fixture must preserve the container size to exercise hash freshness")
 
+	// An append that advances neither updated_at nor the container size is
+	// invisible to the changed-member sweep: the event stays bounded by the
+	// changed set and defers the edit instead of probing every member.
 	engine.SyncPaths([]string{dbPath})
-	assert.Equal(t, 1, engine.LastSyncStats().Synced)
+	deferred, err := archive.GetSessionFull(context.Background(), "omnigent:conv_0000")
+	require.NoError(t, err)
+	require.NotNil(t, deferred)
+	assert.Equal(t, 1, deferred.MessageCount,
+		"the changed-path sweep must defer an edit it cannot see")
+
+	engine = sync.NewEngine(archive, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOmnigent: {root},
+		},
+		Machine: "local",
+	})
+	engine.SyncAll(context.Background(), nil)
 	updated, err := archive.GetSessionFull(context.Background(), "omnigent:conv_0000")
 	require.NoError(t, err)
 	require.NotNil(t, updated)
-	assert.Equal(t, 2, updated.MessageCount)
+	assert.Equal(t, 2, updated.MessageCount,
+		"the scheduled full sync must reconcile edits the sweep deferred")
 }
 
 func TestSyncOmnigentPeriodicFullSyncDetectsInPlaceItemEdit(t *testing.T) {

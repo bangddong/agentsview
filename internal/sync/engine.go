@@ -6863,10 +6863,14 @@ func (e *Engine) markStaleFailedMemberWrite(pw pendingWrite) {
 	if pw.sess.Agent != parser.AgentOmnigent || pw.sess.ID == "" {
 		return
 	}
+	// Sessions are stored under the remote-sync prefixed ID
+	// (applyRemoteRewrites in prepareSessionWrite), so the demotion must
+	// target the same row.
+	id := applyIDPrefixToID(e.idPrefix, pw.sess.ID)
 	staleVersion := max(db.CurrentDataVersion()-1, 0)
-	if e.db.GetSessionDataVersion(pw.sess.ID) > staleVersion {
-		if err := e.db.SetSessionDataVersion(pw.sess.ID, staleVersion); err != nil {
-			log.Printf("mark failed member write stale for %s: %v", pw.sess.ID, err)
+	if e.db.GetSessionDataVersion(id) > staleVersion {
+		if err := e.db.SetSessionDataVersion(id, staleVersion); err != nil {
+			log.Printf("mark failed member write stale for %s: %v", id, err)
 		}
 	}
 }

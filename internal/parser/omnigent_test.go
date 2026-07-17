@@ -659,6 +659,47 @@ func TestOmnigentStoredHintsReconcileBoundaryTombstones(t *testing.T) {
 	assert.Contains(t, firstPaths, VirtualSourcePath(path, "conv_032"))
 }
 
+func TestOmnigentPresentStoredHintsDoNotFanOut(t *testing.T) {
+	path := writeOmnigentCardinalityDB(t, 200)
+	conn, err := openOmnigentDB(path)
+	require.NoError(t, err)
+	schema, err := detectOmnigentSchema(conn)
+	require.NoError(t, err)
+	metas, err := listOmnigentConversationMetas(conn, schema)
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	require.Len(t, metas, 200)
+
+	hints := make([]string, 0, len(metas))
+	for _, meta := range metas {
+		hints = append(hints, VirtualSourcePath(path, meta.member().key(schema)))
+	}
+
+	tracker := newOmnigentChangeTracker()
+	tracker.containers[path] = omnigentTrackedContainer{
+		schema: schema, checkedAt: time.Now().Unix(),
+	}
+	writer, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	_, err = writer.Exec(
+		`UPDATE conversations SET updated_at = ? WHERE id = 'conv_005'`,
+		time.Now().Unix(),
+	)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	changed, err := tracker.changedMembers(
+		context.Background(), filepath.Dir(path), ChangedPathRequest{
+			Path: path, EventKind: "write", StoredSourcePaths: hints,
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, changed, 1,
+		"stored hints for present members must not scale event fan-out "+
+			"with archive size")
+	assert.Equal(t, "conv_005", changed[0].MemberID)
+}
+
 func TestOmnigentSplitWorkspaceChangedPathClassification(t *testing.T) {
 	path := writeOmnigentSplitWorkspaceCardinalityDB(t, 100)
 	conn, err := openOmnigentDB(path)
