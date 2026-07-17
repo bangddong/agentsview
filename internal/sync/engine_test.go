@@ -1253,8 +1253,17 @@ func TestWriteBatchRemoteIDPrefixUsageEvents(t *testing.T) {
 	assert.Equal(t, 50, events[0].OutputTokens)
 }
 
-func TestWriteBatchBulkQueuesFailedOmnigentSession(t *testing.T) {
+func TestWriteBatchBulkDemotesFailedOmnigentSession(t *testing.T) {
 	database := openTestDB(t)
+	// Seed the session at the current data version, then fail its update:
+	// the demotion must mark the stored row stale, not leave it current.
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: "omnigent:failed", Agent: string(parser.AgentOmnigent),
+		Project: "project-a", Machine: "local",
+	}))
+	require.NoError(t, database.SetSessionDataVersion(
+		"omnigent:failed", db.CurrentDataVersion(),
+	))
 	raw, err := sql.Open("sqlite3", database.Path())
 	require.NoError(t, err)
 	defer raw.Close()
@@ -1266,7 +1275,7 @@ func TestWriteBatchBulkQueuesFailedOmnigentSession(t *testing.T) {
 		END`)
 	require.NoError(t, err)
 
-	e := &Engine{db: database, containerSchedulers: omnigentTestSchedulers(t)}
+	e := &Engine{db: database}
 	container := filepath.Join(t.TempDir(), "chat.db")
 	makeWrite := func(rawID string) pendingWrite {
 		return pendingWrite{sess: parser.ParsedSession{
@@ -1285,15 +1294,10 @@ func TestWriteBatchBulkQueuesFailedOmnigentSession(t *testing.T) {
 	}, true)
 	assert.Equal(t, 1, written)
 	assert.Equal(t, 1, failed)
-
-	e.containerRetryMu.Lock()
-	retry, queued := e.containerRetrySources[containerRetrySource{
-		agent:     parser.AgentOmnigent,
-		sessionID: "omnigent:failed",
-	}.key()]
-	e.containerRetryMu.Unlock()
-	require.True(t, queued)
-	assert.Equal(t, parser.VirtualSourcePath(container, "failed"), retry.filePath)
+	assert.Less(t, database.GetSessionDataVersion("omnigent:failed"),
+		db.CurrentDataVersion(),
+		"a failed member write must demote stored freshness so the next "+
+			"container parse rewrites it")
 }
 
 func TestProjectIdentityWriteBatchDiscoversLocalGitRemote(t *testing.T) {

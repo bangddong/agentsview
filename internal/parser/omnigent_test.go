@@ -474,8 +474,15 @@ func TestOmnigentProviderUnsupportedSchemaIsNonDestructive(t *testing.T) {
 	require.True(t, ok)
 	sources, err := provider.Discover(context.Background())
 	require.NoError(t, err)
-	assert.Empty(t, sources,
-		"unsupported discovery must not emit an authoritative empty source")
+	require.Len(t, sources, 1)
+	outcome, err := provider.Parse(
+		context.Background(), ParseRequest{Source: sources[0]},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, SkipUnsupportedSource, outcome.SkipReason,
+		"an unsupported schema must skip, not retire, the archive")
+	assert.False(t, outcome.ForceReplace)
+	assert.Empty(t, outcome.Results)
 }
 
 func TestOmnigentFingerprintChangesWithContent(t *testing.T) {
@@ -514,8 +521,9 @@ func TestOmnigentFingerprintChangesWithContent(t *testing.T) {
 }
 
 // TestOmnigentChangedPathParsingIsBounded is the production-path cardinality
-// regression: the provider resolves the same bounded member batch when the
-// unchanged archive grows from one hundred conversations to two hundred.
+// regression: a warm changed-path event resolves only the changed member, and
+// the fan-out stays the same when the unchanged archive grows from one hundred
+// conversations to two hundred.
 func TestOmnigentChangedPathParsingIsBounded(t *testing.T) {
 	for _, archiveSize := range []int{100, 200} {
 		t.Run(fmt.Sprintf("archive_%d", archiveSize), func(t *testing.T) {
@@ -547,8 +555,7 @@ func TestOmnigentChangedPathParsingIsBounded(t *testing.T) {
 					Path: path + "-wal", EventKind: "write",
 				})
 			require.NoError(t, err)
-			require.NotEmpty(t, changed)
-			require.LessOrEqual(t, len(changed), omnigentChangedBatchSize)
+			require.Len(t, changed, 1)
 			changedIndex := slices.IndexFunc(changed, func(source SourceRef) bool {
 				return source.DisplayPath == VirtualSourcePath(path, changedID)
 			})
@@ -562,194 +569,6 @@ func TestOmnigentChangedPathParsingIsBounded(t *testing.T) {
 				outcome.Results[0].Result.Session.File.Mtime)
 		})
 	}
-}
-
-func TestOmnigentChangedPathEventuallyDetectsDirectEditWithoutMetadataAdvance(t *testing.T) {
-	path := writeOmnigentCardinalityDB(t, 65)
-	provider, ok := NewProvider(AgentOmnigent, ProviderConfig{
-		Roots: []string{filepath.Dir(path)}, Machine: "host",
-	})
-	require.True(t, ok)
-	initializeOmnigentProvider(t, provider, 65)
-
-	writer, err := sql.Open("sqlite3", path)
-	require.NoError(t, err)
-	_, err = writer.Exec(`UPDATE conversation_items
-		SET data = '{"role":"user","content":[{"type":"input_text","text":"changed"}]}'
-		WHERE id = 'conv_064_i0'`)
-	require.NoError(t, err)
-	require.NoError(t, writer.Close())
-
-	var found SourceRef
-	for range 3 {
-		changed, changedErr := provider.SourcesForChangedPath(
-			context.Background(), ChangedPathRequest{Path: path, EventKind: "write"})
-		require.NoError(t, changedErr)
-		assert.LessOrEqual(t, len(changed), omnigentProbeBatchSize)
-		for _, source := range changed {
-			if source.DisplayPath == VirtualSourcePath(path, "conv_064") {
-				found = source
-			}
-		}
-		if found.DisplayPath != "" {
-			break
-		}
-	}
-	assert.Equal(t, VirtualSourcePath(path, "conv_064"), found.DisplayPath)
-}
-
-func TestOmnigentRecoveryFailurePreservesTrackerAndBlocksColdFallback(t *testing.T) {
-	path := writeOmnigentCardinalityDB(t, 65)
-	root := filepath.Dir(path)
-	tracker := newOmnigentChangeTracker()
-	first, err := tracker.changedMembers(
-		context.Background(), root,
-		ChangedPathRequest{Path: path, EventKind: "write"},
-	)
-	require.NoError(t, err)
-	require.Len(t, first, omnigentChangedBatchSize)
-	tracker.mu.Lock()
-	before := tracker.containers[path]
-	tracker.mu.Unlock()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err = tracker.changedMembers(ctx, root, ChangedPathRequest{
-		Path: path, EventKind: ChangedPathEventRecovery,
-	})
-	require.ErrorIs(t, err, context.Canceled)
-	tracker.mu.Lock()
-	after := tracker.containers[path]
-	assert.Equal(t, before, after, "failed recovery must preserve the previous tracker")
-	_, pending := tracker.recoveryPending[path]
-	tracker.mu.Unlock()
-	assert.True(t, pending)
-	assert.Empty(t, tracker.discoverSources(root, false),
-		"ordinary discovery must not seed or emit a whole container while recovery is pending")
-
-	recovered, err := tracker.changedMembers(
-		context.Background(), root, ChangedPathRequest{
-			Path: path, EventKind: ChangedPathEventRecovery,
-		},
-	)
-	require.NoError(t, err)
-	assert.Len(t, recovered, omnigentChangedBatchSize)
-	tracker.mu.Lock()
-	_, pending = tracker.recoveryPending[path]
-	assert.True(t, tracker.containers[path].recovering)
-	tracker.mu.Unlock()
-	assert.False(t, pending)
-}
-
-func TestOmnigentProbeReconcilesReplacementWithReusedRowID(t *testing.T) {
-	path := writeOmnigentCardinalityDB(t, 65)
-	provider, ok := NewProvider(AgentOmnigent, ProviderConfig{
-		Roots: []string{filepath.Dir(path)}, Machine: "host",
-	})
-	require.True(t, ok)
-	initializeOmnigentProvider(t, provider, 65)
-
-	writer, err := sql.Open("sqlite3", path)
-	require.NoError(t, err)
-	_, err = writer.Exec(`DELETE FROM conversation_items
-		WHERE conversation_id = 'conv_000'`)
-	require.NoError(t, err)
-	_, err = writer.Exec(`DELETE FROM conversations WHERE id = 'conv_000'`)
-	require.NoError(t, err)
-	_, err = writer.Exec(`INSERT INTO conversations
-		(rowid, id, created_at, updated_at, title, kind, root_conversation_id)
-		VALUES (1, 'replacement', 1, 2, 'replacement', 'default', 'replacement')`)
-	require.NoError(t, err)
-	_, err = writer.Exec(`INSERT INTO conversation_items
-		(id, conversation_id, position, type, data, search_text)
-		VALUES ('replacement_i0', 'replacement', 0, 'message',
-			'{"role":"user","content":[{"type":"input_text","text":"replacement"}]}',
-			'replacement')`)
-	require.NoError(t, err)
-	require.NoError(t, writer.Close())
-
-	changed, err := provider.SourcesForChangedPath(
-		context.Background(), ChangedPathRequest{
-			Path: path, EventKind: "write",
-			StoredSourcePaths: []string{VirtualSourcePath(path, "conv_000")},
-		})
-	require.NoError(t, err)
-	paths := make([]string, 0, len(changed))
-	for _, source := range changed {
-		paths = append(paths, source.DisplayPath)
-	}
-	assert.Contains(t, paths, VirtualSourcePath(path, "conv_000"))
-	assert.Contains(t, paths, VirtualSourcePath(path, "replacement"))
-	assert.LessOrEqual(t, len(changed), omnigentProbeBatchSize+1)
-}
-
-func TestOmnigentColdChangedPathParseWorkIsBounded(t *testing.T) {
-	for _, archiveSize := range []int{64, 1000} {
-		t.Run(fmt.Sprintf("archive_%d", archiveSize), func(t *testing.T) {
-			path := writeOmnigentCardinalityDB(t, archiveSize)
-			factory, ok := ProviderFactoryByType(AgentOmnigent)
-			require.True(t, ok)
-			provider := factory.NewProvider(ProviderConfig{
-				Roots: []string{filepath.Dir(path)}, Machine: "host",
-			})
-			changed, err := provider.SourcesForChangedPath(
-				context.Background(), ChangedPathRequest{Path: path, EventKind: "write"},
-			)
-			require.NoError(t, err)
-			require.Len(t, changed, omnigentChangedBatchSize)
-			parsedResults := 0
-			parsedMessages := 0
-			for _, source := range changed {
-				assert.False(t, IsOmnigentContainerSource(source))
-				outcome, err := provider.Parse(
-					context.Background(), ParseRequest{Source: source},
-				)
-				require.NoError(t, err)
-				parsedResults += len(outcome.Results)
-				for _, result := range outcome.Results {
-					parsedMessages += len(result.Result.Messages)
-				}
-			}
-			assert.Equal(t, omnigentChangedBatchSize, parsedResults)
-			assert.Equal(t, omnigentChangedBatchSize, parsedMessages)
-		})
-	}
-}
-
-func TestOmnigentColdTrackerAllocationsStayBoundedAsArchiveGrows(t *testing.T) {
-	measure := func(t *testing.T, archiveSize int) float64 {
-		t.Helper()
-		path := writeOmnigentCardinalityDB(t, archiveSize)
-		root := filepath.Dir(path)
-		allocs := testing.AllocsPerRun(5, func() {
-			tracker := newOmnigentChangeTracker()
-			matches := tracker.discoverSources(root, false)
-			if len(matches) != omnigentChangedBatchSize {
-				panic(fmt.Sprintf("got %d cold matches", len(matches)))
-			}
-		})
-
-		tracker := newOmnigentChangeTracker()
-		discovered := 0
-		for discovered < archiveSize {
-			matches := tracker.discoverSources(root, false)
-			require.NotEmpty(t, matches)
-			require.LessOrEqual(t, len(matches), omnigentChangedBatchSize)
-			discovered += len(matches)
-		}
-		tracker.mu.Lock()
-		require.Len(t, tracker.containers, 1)
-		state := tracker.containers[path]
-		tracker.mu.Unlock()
-		assert.False(t, state.initializing)
-		assert.False(t, state.probeActive)
-		return allocs
-	}
-
-	small := measure(t, 64)
-	large := measure(t, 2000)
-	assert.LessOrEqual(t, large, small*2,
-		"cold tracker allocation must depend on page size, not archive cardinality")
 }
 
 func TestOmnigentColdEmptyChangedPathReconcilesAuthoritatively(t *testing.T) {
@@ -774,9 +593,17 @@ func TestOmnigentColdEmptyChangedPathReconcilesAuthoritatively(t *testing.T) {
 	assert.True(t, outcome.ForceReplace)
 }
 
-func TestOmnigentColdChangedPathCancellationDoesNotAdvanceTracker(t *testing.T) {
-	path := writeOmnigentCardinalityDB(t, 1000)
+func TestOmnigentChangedPathCancellationDoesNotAdvanceFloor(t *testing.T) {
+	path := writeOmnigentCardinalityDB(t, 5)
+	conn, err := openOmnigentDB(path)
+	require.NoError(t, err)
+	schema, err := detectOmnigentSchema(conn)
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
 	tracker := newOmnigentChangeTracker()
+	tracker.containers[path] = omnigentTrackedContainer{
+		schema: schema, checkedAt: 5,
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -786,53 +613,10 @@ func TestOmnigentColdChangedPathCancellationDoesNotAdvanceTracker(t *testing.T) 
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Empty(t, changed)
 	tracker.mu.Lock()
-	_, initialized := tracker.containers[path]
+	floor := tracker.containers[path].checkedAt
 	tracker.mu.Unlock()
-	assert.False(t, initialized)
-}
-
-func TestOmnigentColdChangedPathCursorAdvancesWithoutParsing(t *testing.T) {
-	path := writeOmnigentCardinalityDB(t, 1000)
-	factory, ok := ProviderFactoryByType(AgentOmnigent)
-	require.True(t, ok)
-	provider := factory.NewProvider(ProviderConfig{
-		Roots: []string{filepath.Dir(path)}, Machine: "host",
-	})
-	first, err := provider.SourcesForChangedPath(
-		context.Background(), ChangedPathRequest{Path: path, EventKind: "write"},
-	)
-	require.NoError(t, err)
-	require.Len(t, first, omnigentChangedBatchSize)
-
-	second, err := provider.SourcesForChangedPath(
-		context.Background(), ChangedPathRequest{Path: path, EventKind: "write"},
-	)
-	require.NoError(t, err)
-	require.Len(t, second, omnigentChangedBatchSize)
-	assert.Equal(t, VirtualSourcePath(path, "conv_000"), first[0].DisplayPath)
-	assert.Equal(t, VirtualSourcePath(path, "conv_032"), second[0].DisplayPath)
-}
-
-func TestOmnigentColdChangedPathEmitsBoundedStoredTombstones(t *testing.T) {
-	path := writeOmnigentCardinalityDB(t, 1000)
-	factory, ok := ProviderFactoryByType(AgentOmnigent)
-	require.True(t, ok)
-	provider := factory.NewProvider(ProviderConfig{
-		Roots: []string{filepath.Dir(path)}, Machine: "host",
-	})
-	missing := VirtualSourcePath(path, "deleted")
-	changed, err := provider.SourcesForChangedPath(
-		context.Background(), ChangedPathRequest{
-			Path: path, EventKind: "write", StoredSourcePaths: []string{missing},
-		},
-	)
-	require.NoError(t, err)
-	paths := make([]string, 0, len(changed))
-	for _, source := range changed {
-		paths = append(paths, source.DisplayPath)
-	}
-	assert.Contains(t, paths, missing)
-	assert.LessOrEqual(t, len(changed), omnigentChangedBatchSize+1)
+	assert.EqualValues(t, 5, floor,
+		"a failed sweep must not advance past unobserved changes")
 }
 
 func TestOmnigentStoredHintsReconcileBoundaryTombstones(t *testing.T) {
@@ -873,10 +657,9 @@ func TestOmnigentStoredHintsReconcileBoundaryTombstones(t *testing.T) {
 	}
 	assert.Contains(t, firstPaths, VirtualSourcePath(path, "conv_031"))
 	assert.Contains(t, firstPaths, VirtualSourcePath(path, "conv_032"))
-	assert.LessOrEqual(t, len(first), omnigentChangedBatchSize)
 }
 
-func TestOmnigentSplitWorkspaceClassificationIsBatched(t *testing.T) {
+func TestOmnigentSplitWorkspaceChangedPathClassification(t *testing.T) {
 	path := writeOmnigentSplitWorkspaceCardinalityDB(t, 100)
 	conn, err := openOmnigentDB(path)
 	require.NoError(t, err)
@@ -886,8 +669,11 @@ func TestOmnigentSplitWorkspaceClassificationIsBatched(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 
+	require.NotEmpty(t, metas)
 	tracker := newOmnigentChangeTracker()
-	tracker.replace(path, schema, metas)
+	tracker.containers[path] = omnigentTrackedContainer{
+		schema: schema, checkedAt: time.Now().Unix(),
+	}
 
 	writer, err := sql.Open("sqlite3", path)
 	require.NoError(t, err)
@@ -898,122 +684,14 @@ func TestOmnigentSplitWorkspaceClassificationIsBatched(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, writer.Close())
 
-	var found multiSessionMatch
-	for attempt := range 4 {
-		eventKind := "poll"
-		if attempt == 0 {
-			eventKind = "write"
-		}
-		changed, changedErr := tracker.changedMembers(
-			context.Background(), filepath.Dir(path), ChangedPathRequest{
-				Path: path, EventKind: eventKind,
-			},
-		)
-		require.NoError(t, changedErr)
-		assert.LessOrEqual(t, len(changed), omnigentChangedBatchSize)
-		for _, match := range changed {
-			if match.MemberID == "99:conv" {
-				found = match
-			}
-		}
-		if found.MemberID != "" {
-			break
-		}
-	}
-	assert.Equal(t, "99:conv", found.MemberID)
-}
-
-func TestOmnigentMemberParseDoesNotObserveNewerMetadata(t *testing.T) {
-	path := writeOmnigentOldGenDB(t)
-	conn, err := openOmnigentDB(path)
-	require.NoError(t, err)
-	schema, err := detectOmnigentSchema(conn)
-	require.NoError(t, err)
-	metas, err := listOmnigentConversationMetas(conn, schema)
-	require.NoError(t, err)
-	require.NoError(t, conn.Close())
-
-	tracker := newOmnigentChangeTracker()
-	tracker.replace(path, schema, metas)
-	src := multiSessionSource{Container: path, MemberID: "conv_root"}
-	_, err = tracker.parseMemberWith(src, ParseRequest{},
-		func(multiSessionSource, ParseRequest) (*ParseResult, error) {
-			writer, openErr := sql.Open("sqlite3", path)
-			if openErr != nil {
-				return nil, openErr
-			}
-			defer writer.Close()
-			_, updateErr := writer.Exec(
-				`UPDATE conversations SET updated_at = updated_at + 60
-				  WHERE id = 'conv_root'`)
-			return &ParseResult{}, updateErr
-		})
-	require.NoError(t, err)
-
-	changed, err := tracker.changedMembers(context.Background(), filepath.Dir(path), ChangedPathRequest{
-		Path: path, EventKind: "write",
-	})
-	require.NoError(t, err)
-	assert.True(t, slices.ContainsFunc(changed, func(match multiSessionMatch) bool {
-		return match.MemberID == "conv_root"
-	}),
-		"a commit concurrent with parsing must remain visible to the next event")
-}
-
-func TestOmnigentFastChangeWindowPagesPastFirstBatch(t *testing.T) {
-	path := writeOmnigentCardinalityDB(t, 65)
-	root := filepath.Dir(path)
-	tracker := newOmnigentChangeTracker()
-	for range 4 {
-		_, err := tracker.changedMembers(
-			context.Background(), root,
-			ChangedPathRequest{Path: path, EventKind: "poll"},
-		)
-		require.NoError(t, err)
-		tracker.mu.Lock()
-		initializing := tracker.containers[path].initializing
-		tracker.mu.Unlock()
-		if !initializing {
-			break
-		}
-	}
-
-	changedAt := time.Now().Unix()
-	writer, err := sql.Open("sqlite3", path)
-	require.NoError(t, err)
-	_, err = writer.Exec(
-		`UPDATE conversations SET updated_at = ? WHERE rowid <= 12`,
-		changedAt,
+	changed, err := tracker.changedMembers(
+		context.Background(), filepath.Dir(path), ChangedPathRequest{
+			Path: path, EventKind: "write",
+		},
 	)
 	require.NoError(t, err)
-	require.NoError(t, writer.Close())
-
-	compositeMTime, err := omnigentDBCompositeMtime(path)
-	require.NoError(t, err)
-	tracker.mu.Lock()
-	tracked := tracker.containers[path]
-	tracked.checkedAt = changedAt
-	tracked.compositeMTimeNS = compositeMTime
-	tracked.probeActive = false
-	tracked.probeRepeat = false
-	tracker.containers[path] = tracked
-	tracker.mu.Unlock()
-
-	seen := make(map[string]struct{})
-	for _, want := range []int{omnigentFastChangedBatchSize, 4} {
-		changed, err := tracker.changedMembers(
-			context.Background(), root,
-			ChangedPathRequest{Path: path, EventKind: "poll"},
-		)
-		require.NoError(t, err)
-		require.Len(t, changed, want)
-		for _, match := range changed {
-			seen[match.MemberID] = struct{}{}
-		}
-	}
-	assert.Len(t, seen, 12)
-	assert.Contains(t, seen, "conv_011",
-		"the keyset cursor must surface changes after the first page")
+	require.Len(t, changed, 1)
+	assert.Equal(t, "99:conv", changed[0].MemberID)
 }
 
 func writeOmnigentCardinalityDB(t *testing.T, count int) string {
@@ -1047,21 +725,14 @@ func writeOmnigentCardinalityDB(t *testing.T, count int) string {
 
 func initializeOmnigentProvider(t *testing.T, provider Provider, want int) {
 	t.Helper()
-	parsed := 0
-	for parsed < want {
-		sources, err := provider.Discover(context.Background())
-		require.NoError(t, err)
-		require.NotEmpty(t, sources)
-		require.LessOrEqual(t, len(sources), omnigentChangedBatchSize)
-		for _, source := range sources {
-			outcome, err := provider.Parse(
-				context.Background(), ParseRequest{Source: source},
-			)
-			require.NoError(t, err)
-			parsed += len(outcome.Results)
-		}
-	}
-	require.Equal(t, want, parsed)
+	sources, err := provider.Discover(context.Background())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	outcome, err := provider.Parse(
+		context.Background(), ParseRequest{Source: sources[0]},
+	)
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, want)
 }
 
 func writeOmnigentSplitWorkspaceCardinalityDB(t *testing.T, count int) string {

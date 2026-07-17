@@ -38,12 +38,6 @@ type SourceCapabilities struct {
 	ExcludedSessions     CapabilitySupport
 	ForceReplaceOnParse  CapabilitySupport
 	VerifiedLocalStat    CapabilitySupport
-	// ContainerScheduling asks the engine to run its bounded shared-container
-	// scheduling for this provider: paged stored-hint reconciliation sweeps,
-	// a bounded source/session retry queue with container-collapse recovery,
-	// and container retry queueing after an aborted resync. A factory that
-	// declares it must implement ContainerScheduler.
-	ContainerScheduling CapabilitySupport
 }
 
 // ContentCapabilities declares optional normalized content fields a provider

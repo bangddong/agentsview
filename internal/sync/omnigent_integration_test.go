@@ -37,24 +37,6 @@ func (f omnigentParseCountingFactory) Capabilities() parser.Capabilities {
 	return f.delegate.Capabilities()
 }
 
-// The delegate declares ContainerScheduling, so the decorator must forward
-// the ContainerScheduler implementation the capability promises.
-func (f omnigentParseCountingFactory) SplitContainerMemberPath(
-	path string,
-) (string, string, bool) {
-	return f.delegate.(parser.ContainerScheduler).SplitContainerMemberPath(path)
-}
-
-func (f omnigentParseCountingFactory) MemberSessionID(memberID string) string {
-	return f.delegate.(parser.ContainerScheduler).MemberSessionID(memberID)
-}
-
-func (f omnigentParseCountingFactory) IsContainerSource(
-	source parser.SourceRef,
-) bool {
-	return f.delegate.(parser.ContainerScheduler).IsContainerSource(source)
-}
-
 func (f omnigentParseCountingFactory) NewProvider(
 	cfg parser.ProviderConfig,
 ) parser.Provider {
@@ -176,35 +158,16 @@ func syncOmnigentArchive(
 	t *testing.T, engine *sync.Engine, archive *db.DB, want int,
 ) {
 	t.Helper()
-	maxPasses := (want+omnigentMemberBatchForTest-1)/omnigentMemberBatchForTest + 2
-	for range maxPasses {
-		engine.SyncAll(context.Background(), nil)
-		stats := engine.LastSyncStats()
-		require.Zero(t, stats.Failed)
-		require.LessOrEqual(t, stats.Synced, omnigentMemberBatchForTest,
-			"each initialization pass must remain bounded")
-		page, err := archive.ListSessions(context.Background(), db.SessionFilter{
-			Agent:           string(parser.AgentOmnigent),
-			IncludeChildren: true,
-			Limit:           1,
-		})
-		require.NoError(t, err)
-		if page.Total == want {
-			settlePasses := (want+omnigentMemberBatchForTest-1)/omnigentMemberBatchForTest + 1
-			for range settlePasses {
-				engine.SyncAll(context.Background(), nil)
-				stats = engine.LastSyncStats()
-				require.Zero(t, stats.Failed)
-				require.Zero(t, stats.Synced,
-					"initial reconciliation must not rewrite unchanged sessions")
-				require.LessOrEqual(t, stats.TotalSessions, omnigentMemberBatchForTest,
-					"initial reconciliation must remain bounded")
-			}
-			return
-		}
-	}
-	require.FailNow(t, "Omnigent archive did not finish bounded initialization",
-		"wanted %d sessions", want)
+	engine.SyncAll(context.Background(), nil)
+	stats := engine.LastSyncStats()
+	require.Zero(t, stats.Failed)
+	page, err := archive.ListSessions(context.Background(), db.SessionFilter{
+		Agent:           string(parser.AgentOmnigent),
+		IncludeChildren: true,
+		Limit:           1,
+	})
+	require.NoError(t, err)
+	require.Equal(t, want, page.Total)
 }
 
 func splitSQLStatements(ddl string) []string {
@@ -329,74 +292,6 @@ func TestSyncOmnigentChangedPathWorkIsBounded(t *testing.T) {
 	}
 }
 
-func TestSyncOmnigentColdChangedPathAdvancesPastFreshArchiveMembers(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-	const archiveSize = 200
-	root := t.TempDir()
-	dbPath := writeOmnigentSyncDB(t, root, archiveSize)
-	archive := dbtest.OpenTestDB(t)
-	seedEngine := sync.NewEngine(archive, sync.EngineConfig{
-		AgentDirs: map[parser.AgentType][]string{parser.AgentOmnigent: {root}},
-		Machine:   "local",
-	})
-	syncOmnigentArchive(t, seedEngine, archive, archiveSize)
-	seedEngine.Close()
-
-	writer, err := sql.Open("sqlite3", dbPath)
-	require.NoError(t, err)
-	changedAt := time.Now().Unix()
-	_, err = writer.Exec(
-		`UPDATE conversations SET updated_at = ? WHERE id = 'conv_0100'`,
-		changedAt,
-	)
-	require.NoError(t, err)
-	_, err = writer.Exec(`INSERT INTO conversation_items
-		(id, conversation_id, position, type, data, search_text)
-		VALUES ('conv_0100_1', 'conv_0100', 1, 'message', ?, 'changed')`,
-		`{"role":"assistant","content":[{"type":"output_text","text":"changed"}]}`)
-	require.NoError(t, err)
-	_, err = writer.Exec(
-		`DELETE FROM conversation_items WHERE conversation_id = 'conv_0050'`,
-	)
-	require.NoError(t, err)
-	_, err = writer.Exec(`DELETE FROM conversations WHERE id = 'conv_0050'`)
-	require.NoError(t, err)
-	require.NoError(t, writer.Close())
-
-	var parseCount atomic.Int64
-	factory := omnigentParseCountingFactory{
-		delegate: omnigentDefaultProviderFactory(t), count: &parseCount,
-	}
-	coldEngine := sync.NewEngine(archive, sync.EngineConfig{
-		AgentDirs: map[parser.AgentType][]string{parser.AgentOmnigent: {root}},
-		Machine:   "local", ProviderFactories: []parser.ProviderFactory{factory},
-	})
-	before := parseCount.Load()
-	coldEngine.SyncPaths([]string{dbPath})
-	assert.LessOrEqual(t, parseCount.Load()-before, int64(omnigentMemberBatchForTest+1),
-		"the activating event must keep parse work within one member page plus tombstones")
-	var changed *db.Session
-	var deleted *db.Session
-	for range 7 {
-		before = parseCount.Load()
-		coldEngine.SyncAll(context.Background(), nil)
-		assert.LessOrEqual(t, parseCount.Load()-before, int64(2*omnigentMemberBatchForTest+1),
-			"each periodic continuation must keep parse work within bounded member pages")
-		changed, err = archive.GetSession(context.Background(), "omnigent:conv_0100")
-		require.NoError(t, err)
-		deleted, err = archive.GetSession(context.Background(), "omnigent:conv_0050")
-		require.NoError(t, err)
-		if changed != nil && changed.MessageCount == 2 && deleted == nil {
-			break
-		}
-	}
-	require.NotNil(t, changed)
-	assert.Equal(t, 2, changed.MessageCount)
-	assert.Nil(t, deleted)
-}
-
 func TestSyncOmnigentUnchangedAfterBoundedInitializationDoesNoWork(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
@@ -422,53 +317,6 @@ func TestSyncOmnigentUnchangedAfterBoundedInitializationDoesNoWork(t *testing.T)
 	engine.SyncAll(context.Background(), nil)
 	assert.Zero(t, parseCount.Load(),
 		"unchanged container must not reparse every conversation")
-}
-
-func TestSyncOmnigentFreshTrackerWarmStartIsBounded(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-	root := t.TempDir()
-	dbPath := writeOmnigentSyncDB(t, root, 200)
-	archive := dbtest.OpenTestDB(t)
-	first := sync.NewEngine(archive, sync.EngineConfig{
-		AgentDirs: map[parser.AgentType][]string{
-			parser.AgentOmnigent: {root},
-		},
-		Machine:           "local",
-		ProviderFactories: []parser.ProviderFactory{omnigentDefaultProviderFactory(t)},
-	})
-	syncOmnigentArchive(t, first, archive, 200)
-	first.Close()
-
-	var parseCount atomic.Int64
-	second := sync.NewEngine(archive, sync.EngineConfig{
-		AgentDirs: map[parser.AgentType][]string{
-			parser.AgentOmnigent: {root},
-		},
-		Machine: "local",
-		ProviderFactories: []parser.ProviderFactory{omnigentParseCountingFactory{
-			delegate: omnigentDefaultProviderFactory(t),
-			count:    &parseCount,
-		}},
-	})
-	defer second.Close()
-	second.SyncAll(context.Background(), nil)
-	assert.LessOrEqual(t, parseCount.Load(), int64(omnigentMemberBatchForTest),
-		"a fresh tracker must not materialize the stored archive")
-	assert.Zero(t, second.LastSyncStats().Synced,
-		"warm-start discovery should not rewrite unchanged sessions")
-
-	writer, err := sql.Open("sqlite3", dbPath)
-	require.NoError(t, err)
-	_, err = writer.Exec(`UPDATE conversations SET updated_at = ?
-		WHERE id = 'conv_0000'`, time.Now().Unix())
-	require.NoError(t, err)
-	require.NoError(t, writer.Close())
-	parseCount.Store(0)
-	second.SyncAll(context.Background(), nil)
-	assert.LessOrEqual(t, parseCount.Load(), int64(omnigentMemberBatchForTest),
-		"the next change should use bounded member discovery")
 }
 
 func TestSyncOmnigentInitialContainerFailureIsRetried(t *testing.T) {
@@ -502,11 +350,10 @@ func TestSyncOmnigentInitialContainerFailureIsRetried(t *testing.T) {
 	assert.NotNil(t, session, "the failed physical source must remain retryable")
 }
 
-func TestSyncOmnigentChangedFullSyncWorkIsBounded(t *testing.T) {
+func TestSyncOmnigentFullSyncWritesOnlyChangedMembers(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
-	const boundedMemberBatch = int64(omnigentMemberBatchForTest)
 	for _, archiveSize := range []int{200, 2000} {
 		t.Run(fmt.Sprintf("archive_%d", archiveSize), func(t *testing.T) {
 			root := t.TempDir()
@@ -527,6 +374,11 @@ func TestSyncOmnigentChangedFullSyncWorkIsBounded(t *testing.T) {
 			})
 			syncOmnigentArchive(t, engine, archive, archiveSize)
 
+			parseCount.Store(0)
+			engine.SyncAll(context.Background(), nil)
+			assert.Zero(t, parseCount.Load(),
+				"an unchanged container must be skipped without parsing")
+
 			writer, err := sql.Open("sqlite3", dbPath)
 			require.NoError(t, err)
 			_, err = writer.Exec(`UPDATE conversations
@@ -539,20 +391,11 @@ func TestSyncOmnigentChangedFullSyncWorkIsBounded(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, writer.Close())
 
-			parseCount.Store(0)
-			resultCount.Store(0)
 			engine.SyncAll(context.Background(), nil)
-			assert.Positive(t, parseCount.Load())
-			assert.LessOrEqual(t, parseCount.Load(), boundedMemberBatch)
-			assert.Equal(t, parseCount.Load(), resultCount.Load(),
-				"periodic work must not grow with unchanged archive size")
-			assert.Equal(t, 1, engine.LastSyncStats().Synced)
+			assert.Equal(t, 1, engine.LastSyncStats().Synced,
+				"only the changed member may be rewritten")
 
-			deleteIndex := 1
-			if archiveSize > 32 {
-				deleteIndex = 32
-			}
-			deletedID := fmt.Sprintf("conv_%04d", deleteIndex)
+			deletedID := "conv_0001"
 			writer, err = sql.Open("sqlite3", dbPath)
 			require.NoError(t, err)
 			_, err = writer.Exec(`DELETE FROM conversation_items
@@ -562,122 +405,15 @@ func TestSyncOmnigentChangedFullSyncWorkIsBounded(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, writer.Close())
 
-			parseCount.Store(0)
-			resultCount.Store(0)
 			engine.SyncAll(context.Background(), nil)
-			assert.Equal(t, boundedMemberBatch, parseCount.Load())
-			assert.Equal(t, boundedMemberBatch-1, resultCount.Load(),
-				"tombstone reconciliation must remain one bounded batch")
+			assert.Zero(t, engine.LastSyncStats().Synced,
+				"reconciling a deletion must not rewrite surviving members")
 			deleted, err := archive.GetSession(
 				context.Background(), "omnigent:"+deletedID)
 			require.NoError(t, err)
 			assert.Nil(t, deleted)
 		})
 	}
-}
-
-func TestSyncOmnigentRetriesFailedDirectEditProbe(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-	root := t.TempDir()
-	dbPath := writeOmnigentSyncDB(t, root, 65)
-	archive := dbtest.OpenTestDB(t)
-	var failed atomic.Bool
-	factory := omnigentParseCountingFactory{
-		delegate: omnigentDefaultProviderFactory(t),
-		count:    &atomic.Int64{},
-		failPath: parser.VirtualSourcePath(dbPath, "conv_0000"),
-		failOnce: &failed,
-	}
-	seedEngine := sync.NewEngine(archive, sync.EngineConfig{
-		AgentDirs: map[parser.AgentType][]string{
-			parser.AgentOmnigent: {root},
-		},
-		Machine: "local",
-	})
-	syncOmnigentArchive(t, seedEngine, archive, 65)
-	seedEngine.Close()
-
-	engine := sync.NewEngine(archive, sync.EngineConfig{
-		AgentDirs: map[parser.AgentType][]string{
-			parser.AgentOmnigent: {root},
-		},
-		Machine:           "local",
-		ProviderFactories: []parser.ProviderFactory{factory},
-	})
-	defer engine.Close()
-	writer, err := sql.Open("sqlite3", dbPath)
-	require.NoError(t, err)
-	_, err = writer.Exec(`UPDATE conversation_items
-		SET data = '{"role":"user","content":[{"type":"input_text","text":"direct edit"}]}'
-		WHERE id = 'conv_0000_0'`)
-	require.NoError(t, err)
-	require.NoError(t, writer.Close())
-	engine.SyncAll(context.Background(), nil)
-	assert.Equal(t, 1, engine.LastSyncStats().Failed)
-
-	syncOmnigentArchive(t, engine, archive, 65)
-	messages, err := archive.GetMessages(
-		context.Background(), "omnigent:conv_0000", 0, 10, true,
-	)
-	require.NoError(t, err)
-	require.Len(t, messages, 1)
-	assert.Equal(t, "direct edit", messages[0].Content)
-}
-
-func TestSyncOmnigentRetriesAndClearsFailedTombstone(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-	root := t.TempDir()
-	dbPath := writeOmnigentSyncDB(t, root, 1)
-	archive := dbtest.OpenTestDB(t)
-	var parseCount atomic.Int64
-	engine := sync.NewEngine(archive, sync.EngineConfig{
-		AgentDirs: map[parser.AgentType][]string{
-			parser.AgentOmnigent: {root},
-		},
-		Machine: "local",
-		ProviderFactories: []parser.ProviderFactory{omnigentParseCountingFactory{
-			delegate: omnigentDefaultProviderFactory(t),
-			count:    &parseCount,
-		}},
-	})
-	defer engine.Close()
-	engine.SyncAll(context.Background(), nil)
-
-	raw, err := sql.Open("sqlite3", archive.Path())
-	require.NoError(t, err)
-	defer raw.Close()
-	_, err = raw.Exec(`CREATE TRIGGER fail_omnigent_tombstone
-		BEFORE DELETE ON sessions
-		WHEN OLD.id = 'omnigent:conv_0000'
-		BEGIN
-			SELECT RAISE(FAIL, 'injected tombstone failure');
-		END`)
-	require.NoError(t, err)
-	writer, err := sql.Open("sqlite3", dbPath)
-	require.NoError(t, err)
-	_, err = writer.Exec(`DELETE FROM conversation_items
-		WHERE conversation_id = 'conv_0000'`)
-	require.NoError(t, err)
-	_, err = writer.Exec(`DELETE FROM conversations WHERE id = 'conv_0000'`)
-	require.NoError(t, err)
-	require.NoError(t, writer.Close())
-	engine.SyncAll(context.Background(), nil)
-	assert.Equal(t, 1, engine.LastSyncStats().Failed)
-
-	_, err = raw.Exec(`DROP TRIGGER fail_omnigent_tombstone`)
-	require.NoError(t, err)
-	engine.SyncAll(context.Background(), nil)
-	session, err := archive.GetSession(context.Background(), "omnigent:conv_0000")
-	require.NoError(t, err)
-	assert.Nil(t, session)
-
-	parseCount.Store(0)
-	engine.SyncAll(context.Background(), nil)
-	assert.Zero(t, parseCount.Load(), "a successful tombstone must clear its retry")
 }
 
 func TestResyncOmnigentForcesCompleteDiscovery(t *testing.T) {

@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	gosync "sync"
-	"sync/atomic"
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -129,25 +128,12 @@ type Engine struct {
 	// idPrefix and pathRewriter support remote sync:
 	// prefix all session IDs to avoid collisions, rewrite
 	// temp paths to "host:/remote/path" form.
-	ephemeral              bool
-	idPrefix               string
-	pathRewriter           func(string) string
-	emitter                Emitter
-	providerFactories      map[parser.AgentType]parser.ProviderFactory
-	providerMigrationModes map[parser.AgentType]parser.ProviderMigrationMode
-	// containerSchedulers holds the per-agent identity hooks for the
-	// shared-container scheduling capability, resolved once at construction.
-	// The retry queue, hint cursors, and resync flag below are its state; see
-	// container_scheduling.go.
-	containerSchedulers     map[parser.AgentType]parser.ContainerScheduler
-	containerRetryMu        gosync.Mutex
-	containerRetrySources   map[string]*containerRetryEntry
-	containerRetryGroups    map[string]map[string]struct{}
-	containerRetryHead      *containerRetryEntry
-	containerRetryTail      *containerRetryEntry
-	containerHintMu         gosync.Mutex
-	containerHintCursors    map[string]containerHintCursor
-	resyncContainerAdvanced atomic.Bool
+	ephemeral               bool
+	idPrefix                string
+	pathRewriter            func(string) string
+	emitter                 Emitter
+	providerFactories       map[parser.AgentType]parser.ProviderFactory
+	providerMigrationModes  map[parser.AgentType]parser.ProviderMigrationMode
 	projectIdentityMu       gosync.Mutex
 	projectIdentityCache    map[string]projectIdentityCacheEntry
 	projectIdentityWritten  map[string]struct{}
@@ -289,7 +275,6 @@ func NewEngine(
 	if cfg.ProviderMigrationModes != nil {
 		maps.Copy(providerModes, cfg.ProviderMigrationModes)
 	}
-	factoryMap := providerFactoryMap(providerFactories)
 
 	e := &Engine{
 		db:                      database,
@@ -305,10 +290,8 @@ func NewEngine(
 		idPrefix:                cfg.IDPrefix,
 		pathRewriter:            cfg.PathRewriter,
 		emitter:                 cfg.Emitter,
-		providerFactories:       factoryMap,
+		providerFactories:       providerFactoryMap(providerFactories),
 		providerMigrationModes:  providerModes,
-		containerSchedulers:     containerSchedulerMap(factoryMap),
-		containerHintCursors:    make(map[string]containerHintCursor),
 		projectIdentityCache:    make(map[string]projectIdentityCacheEntry),
 		projectIdentityWritten:  make(map[string]struct{}),
 		startupMaintenanceReady: make(chan struct{}),
@@ -777,16 +760,11 @@ func (e *Engine) classifyProviderChangedPath(
 			continue
 		}
 		for _, watchRoot := range watchRoots {
-			if scheduler, ok := e.containerSchedulers[agentType]; ok &&
-				!containerChangedPathOwnedByWatchRoot(scheduler, path, watchRoot) {
-				continue
-			}
 			var storedSourcePaths []string
-			var hintPageClaimed bool
 			if provider.Capabilities().Source.StoredSourceHints == parser.CapabilitySupported {
 				var err error
-				storedSourcePaths, hintPageClaimed, err = e.changedPathStoredSourcePaths(
-					def.Type, watchRoot,
+				storedSourcePaths, err = e.db.ListStoredSourcePathHints(
+					string(def.Type), []string{watchRoot},
 				)
 				if err != nil {
 					log.Printf(
@@ -804,9 +782,6 @@ func (e *Engine) classifyProviderChangedPath(
 					StoredSourcePaths: storedSourcePaths,
 				},
 			)
-			if hintPageClaimed {
-				e.finishContainerStoredHintPage(def.Type, watchRoot, err == nil)
-			}
 			if err != nil {
 				if !errors.Is(err, parser.ErrUnsupportedProviderFeature) {
 					log.Printf(
@@ -1294,13 +1269,6 @@ func (e *Engine) resyncAllWithOptionsLocked(
 	ops rebuildOperations,
 ) (stats SyncStats, retErr error) {
 	ops = ops.withDefaults()
-	resyncAccepted := false
-	e.resyncContainerAdvanced.Store(false)
-	defer func() {
-		if e.resyncContainerAdvanced.Load() && !resyncAccepted {
-			e.queueContainerRetriesAfterAbortedResync()
-		}
-	}()
 	reportResyncProgress := func(p Progress) {
 		p.Resync = true
 		if p.Phase == PhaseSyncing && p.Detail == "" {
@@ -1957,7 +1925,6 @@ func (e *Engine) resyncAllWithOptionsLocked(
 	e.mu.Lock()
 	e.lastSyncStats = stats
 	e.mu.Unlock()
-	resyncAccepted = true
 
 	// Emission happens via the deferred closure above, after
 	// syncMu is released.
@@ -2815,16 +2782,8 @@ func (e *Engine) discoverProviderSources(
 			Machine:            e.machine,
 			ForceFullDiscovery: forceFullDiscovery,
 		})
-		containerScheduler, containerScheduled := e.containerSchedulers[agentType]
-		reconcileContainersFirst := !forceFullDiscovery &&
-			containerScheduled &&
-			e.containerStoredHintSweepActive(agentType, filteredRoots)
 		tDiscover := time.Now()
-		var sources []parser.SourceRef
-		var err error
-		if !reconcileContainersFirst {
-			sources, err = provider.Discover(ctx)
-		}
+		sources, err := provider.Discover(ctx)
 		// Log only providers whose discovery is slow enough to matter, so a
 		// single pathological provider (e.g. a per-source map rebuild) stands
 		// out instead of hiding inside the aggregate discovery timing.
@@ -2841,44 +2800,6 @@ func (e *Engine) discoverProviderSources(
 		}
 		currentSources := providerSourcePathSet(sources)
 		forceParseSources := map[string]struct{}{}
-		if !forceFullDiscovery && containerScheduled {
-			activatedRoots := make(map[string]struct{})
-			for _, source := range sources {
-				if !source.ReconcileStoredHints {
-					continue
-				}
-				container := providerDiscoveredPath(source)
-				if parsed, _, virtual := containerScheduler.SplitContainerMemberPath(container); virtual {
-					container = parsed
-				}
-				watchRoot := filepath.Dir(container)
-				if _, activated := activatedRoots[watchRoot]; activated {
-					continue
-				}
-				activatedRoots[watchRoot] = struct{}{}
-				e.activateContainerStoredHintSweep(agentType, watchRoot)
-			}
-			sources = slices.DeleteFunc(sources, func(source parser.SourceRef) bool {
-				return source.ReconcileOnly
-			})
-			currentSources = providerSourcePathSet(sources)
-			reconciliationSources, reconciliationFailures :=
-				e.discoverContainerReconciliationSources(
-					ctx, agentType, provider, currentSources,
-					max(containerStoredHintBatchSize-len(sources), 0),
-				)
-			sources = append(sources, reconciliationSources...)
-			failures += reconciliationFailures
-			retrySources, retryFailures := e.discoverContainerRetrySources(
-				ctx, agentType, provider, currentSources,
-			)
-			sources = append(sources, retrySources...)
-			failures += retryFailures
-			for _, source := range retrySources {
-				path := filepath.Clean(providerDiscoveredPath(source))
-				forceParseSources[path] = struct{}{}
-			}
-		}
 		if agentType == parser.AgentVSCopilot {
 			missingSources, forceSources :=
 				e.visualStudioCopilotMissingVS2026PollSources(
@@ -4020,12 +3941,10 @@ func (e *Engine) collectAndBatch(
 			// ctx.Done() branch above.
 			if ctx.Err() != nil {
 				stats.Aborted = true
-				e.markContainerSourceRetry(r.agent, r.path)
 				e.drainCanceledResults(results, total-i-1)
 				goto flush
 			}
 			stats.RecordFailed()
-			e.markContainerSourceRetry(r.agent, r.path)
 			e.noteSQLiteContainerResult(r.path, false)
 			if r.cacheSkip && r.mtime != 0 && !r.noCacheSkip {
 				e.cacheSkip(r.skipCacheKey(), r.mtime, r.sourceFingerprint)
@@ -4038,7 +3957,6 @@ func (e *Engine) collectAndBatch(
 				e.cacheSkip(r.skipCacheKey(), r.mtime)
 			}
 			stats.RecordSkip()
-			e.clearContainerSourceRetry(r.agent, r.path)
 			e.noteSQLiteContainerResult(r.path, true)
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
@@ -4063,7 +3981,6 @@ func (e *Engine) collectAndBatch(
 			); err != nil {
 				log.Printf("delete parser-excluded sessions: %v", err)
 				stats.RecordFailed()
-				e.markContainerSourceRetry(r.agent, r.path)
 				e.noteSQLiteContainerResult(r.path, false)
 				continue
 			}
@@ -4072,7 +3989,6 @@ func (e *Engine) collectAndBatch(
 				excludedSessionIDs...,
 			)
 		}
-		e.clearContainerSourceRetry(r.agent, r.path)
 		if len(r.results) == 0 && r.incremental == nil {
 			if len(r.excludedSessionIDs) > 0 {
 				stats.filesOK++
@@ -4110,7 +4026,6 @@ func (e *Engine) collectAndBatch(
 			r.path, vetoed == 0 && len(r.retrySessionIDs) == 0,
 		)
 		if vetoed > 0 && len(allowed) == 0 {
-			e.clearContainerSourceRetry(r.agent, r.path)
 			stats.cwdFilteredFiles++
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
@@ -4229,12 +4144,10 @@ flush:
 	return stats
 }
 
-// drainCanceledResults consumes remaining items so workers can exit while
-// preserving container sources whose parse-side tracker changes were discarded.
+// drainCanceledResults consumes remaining items so workers can exit.
 func (e *Engine) drainCanceledResults(results <-chan syncJob, remaining int) {
 	for range remaining {
-		r := <-results
-		e.markContainerSourceRetry(r.agent, r.path)
+		<-results
 	}
 }
 
@@ -4586,8 +4499,7 @@ func (e *Engine) processProviderFile(
 	// parse entirely. This reproduces the legacy process arm's
 	// shouldSkipFile gate so an unchanged session is not re-parsed on
 	// every full sync.
-	_, containerScheduled := e.containerSchedulers[file.Agent]
-	sourceForceReplace := containerScheduled && file.ForceParse
+	sourceForceReplace := false
 	if mtime, fresh, forceReplace, contentVerified := e.providerSingleSessionFresh(
 		ctx, provider, source, file,
 	); fresh {
@@ -4746,11 +4658,6 @@ func (e *Engine) processProviderFile(
 			noCacheSkip: true,
 		}, true
 	}
-	if scheduler, ok := e.containerSchedulers[file.Agent]; ok &&
-		scheduler.IsContainerSource(source) &&
-		outcome.SkipReason != parser.SkipUnsupportedSource {
-		e.resyncContainerAdvanced.Store(true)
-	}
 	if err := validateProviderOutcome(
 		provider.Definition(),
 		source,
@@ -4806,13 +4713,12 @@ func (e *Engine) processProviderFile(
 		forceReplace:          outcome.ForceReplace || incForceReplace,
 		suppressPresenceSweep: !outcome.ResultSetComplete,
 	}
-	if scheduler, ok := e.containerSchedulers[file.Agent]; ok &&
-		cacheSkip && cleanCache &&
+	if file.Agent == parser.AgentOmnigent && cacheSkip && cleanCache &&
 		!e.forceParse && !file.ForceParse &&
 		outcome.ResultSetComplete && len(outcome.SourceErrors) == 0 &&
 		fingerprint.Hash != "" {
 		path := providerDiscoveredPath(source)
-		_, _, virtual := scheduler.SplitContainerMemberPath(path)
+		_, _, virtual := parser.ParseOmnigentVirtualSourcePath(path)
 		res.cacheAfterWrite = !virtual
 	}
 	// Incremental-append providers (Claude and Codex) need the stored file
@@ -6949,6 +6855,22 @@ type skipCacheWrite struct {
 	sourceFingerprint string
 }
 
+// markStaleFailedMemberWrite demotes the stored data version of a session
+// whose write failed. Shared-container members have no per-file mtime to
+// invalidate, so without the demotion a partial write (session row updated,
+// messages not) would compare as unchanged and never be repaired.
+func (e *Engine) markStaleFailedMemberWrite(pw pendingWrite) {
+	if pw.sess.Agent != parser.AgentOmnigent || pw.sess.ID == "" {
+		return
+	}
+	staleVersion := max(db.CurrentDataVersion()-1, 0)
+	if e.db.GetSessionDataVersion(pw.sess.ID) > staleVersion {
+		if err := e.db.SetSessionDataVersion(pw.sess.ID, staleVersion); err != nil {
+			log.Printf("mark failed member write stale for %s: %v", pw.sess.ID, err)
+		}
+	}
+}
+
 func dataVersionForWrite(pw pendingWrite) int {
 	if !pw.needsRetry {
 		return db.CurrentDataVersion()
@@ -7053,7 +6975,7 @@ func (e *Engine) writeBatch(
 				continue
 			}
 			log.Printf("upsert session %s: %v", s.ID, err)
-			e.markContainerSessionRetry(pw)
+			e.markStaleFailedMemberWrite(pw)
 			failedSessions++
 			continue
 		}
@@ -7083,7 +7005,7 @@ func (e *Engine) writeBatch(
 				"write messages for %s: %v",
 				s.ID, werr,
 			)
-			e.markContainerSessionRetry(pw)
+			e.markStaleFailedMemberWrite(pw)
 			failedSessions++
 			continue
 		}
@@ -7094,7 +7016,7 @@ func (e *Engine) writeBatch(
 				"write usage events for %s: %v",
 				s.ID, err,
 			)
-			e.markContainerSessionRetry(pw)
+			e.markStaleFailedMemberWrite(pw)
 			failedSessions++
 			continue
 		}
@@ -7110,11 +7032,10 @@ func (e *Engine) writeBatch(
 			log.Printf(
 				"set data_version for %s: %v", s.ID, err,
 			)
-			e.markContainerSessionRetry(pw)
+			e.markStaleFailedMemberWrite(pw)
 			failedSessions++
 			continue
 		}
-		e.clearContainerSessionRetry(pw)
 
 		if !replaceMessages {
 			// Same ordering contract as recomputeSignalsFromDB: the
@@ -8020,20 +7941,13 @@ func (e *Engine) writeBatchBulk(
 	if err != nil {
 		log.Printf("write session batch: %v", err)
 		for _, pw := range pendingByID {
-			e.markContainerSessionRetry(pw)
+			e.markStaleFailedMemberWrite(pw)
 		}
 		return 0, 0, len(writes), cwdFiltered
 	}
-	failedIDs := make(map[string]struct{}, len(result.FailedIDs))
 	for _, id := range result.FailedIDs {
-		failedIDs[id] = struct{}{}
 		if pw, ok := pendingByID[id]; ok {
-			e.markContainerSessionRetry(pw)
-		}
-	}
-	for id, pw := range pendingByID {
-		if _, failed := failedIDs[id]; !failed {
-			e.clearContainerSessionRetry(pw)
+			e.markStaleFailedMemberWrite(pw)
 		}
 	}
 	for _, id := range result.ExcludedIDs {

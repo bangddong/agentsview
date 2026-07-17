@@ -35,12 +35,10 @@ type multiSessionSource struct {
 // physical container and, for a member, its ID. ProjectHint is surfaced on the
 // SourceRef for providers that attribute a project at discovery time.
 type multiSessionMatch struct {
-	Path                 string
-	Container            string
-	MemberID             string
-	ProjectHint          string
-	ReconcileStoredHints bool
-	ReconcileOnly        bool
+	Path        string
+	Container   string
+	MemberID    string
+	ProjectHint string
 }
 
 type multiSessionConfig struct {
@@ -611,14 +609,12 @@ func (s multiSessionContainerSourceSet) sourceRef(
 	root string, match multiSessionMatch,
 ) SourceRef {
 	return SourceRef{
-		Provider:             s.agent,
-		Key:                  match.Path,
-		DisplayPath:          match.Path,
-		FingerprintKey:       match.Path,
-		ProjectHint:          match.ProjectHint,
-		ReconcileStoredHints: match.ReconcileStoredHints,
-		ReconcileOnly:        match.ReconcileOnly,
-		Opaque:               match.toSource(root),
+		Provider:       s.agent,
+		Key:            match.Path,
+		DisplayPath:    match.Path,
+		FingerprintKey: match.Path,
+		ProjectHint:    match.ProjectHint,
+		Opaque:         match.toSource(root),
 	}
 }
 
