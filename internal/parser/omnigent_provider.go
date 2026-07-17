@@ -28,6 +28,10 @@ type omnigentTrackedContainer struct {
 	recoveryBoundary bool
 	initialScanRowID int64
 	checkedAt        int64
+	fastThrough      int64
+	fastUpdatedAt    int64
+	fastRowID        int64
+	fastActive       bool
 	compositeMTimeNS int64
 	probeRowID       int64
 	probeActive      bool
@@ -259,9 +263,11 @@ func omnigentFingerprintSource(src multiSessionSource) (SourceFingerprint, error
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
+	// A member ID that no longer parses under the detected schema identifies
+	// a retired legacy member (pre-schema-change identity), not a failure.
 	member, err := omnigentMemberForSchema(schema, src.MemberID)
 	if err != nil {
-		return SourceFingerprint{}, err
+		return SourceFingerprint{}, nil
 	}
 	meta, ok, err := loadOmnigentConversationMeta(conn, schema, member)
 	if err != nil {
@@ -443,15 +449,32 @@ func (t *omnigentChangeTracker) changedMembers(
 		}
 	}
 	checkedAt := time.Now().Unix()
-	fastChanged, err := listOmnigentConversationMetasSince(
-		ctx, conn, schema, nil, max(tracked.checkedAt-1, 0), checkedAt+1,
+	if !tracked.fastActive {
+		tracked.fastThrough = checkedAt + 1
+		tracked.fastUpdatedAt = max(tracked.checkedAt-1, 0)
+		tracked.fastRowID = 0
+		tracked.fastActive = true
+	}
+	fastChanged, err := listOmnigentConversationMetaWindowPage(
+		ctx, conn, schema,
+		max(tracked.checkedAt-1, 0), tracked.fastThrough,
+		tracked.fastUpdatedAt, tracked.fastRowID,
 		omnigentFastChangedBatchSize,
 	)
 	if err != nil {
 		return nil, err
 	}
+	if len(fastChanged) > 0 {
+		last := fastChanged[len(fastChanged)-1]
+		tracked.fastUpdatedAt = last.updatedAt
+		tracked.fastRowID = last.rowID
+	}
 	if len(fastChanged) < omnigentFastChangedBatchSize {
-		tracked.checkedAt = checkedAt
+		tracked.checkedAt = tracked.fastThrough - 1
+		tracked.fastThrough = 0
+		tracked.fastUpdatedAt = 0
+		tracked.fastRowID = 0
+		tracked.fastActive = false
 	}
 	baseMatches := appendOmnigentMatches(
 		omnigentMatches(match.Container, schema, fastChanged), storedMatches,
@@ -609,9 +632,9 @@ func (t *omnigentChangeTracker) initializeRecoveryContainer(
 	), nil
 }
 
-func listOmnigentConversationMetasSince(
+func listOmnigentConversationMetaWindowPage(
 	ctx context.Context, conn *sql.DB, schema omnigentSchema,
-	workspaceIDs []int64, updatedAfter, updatedThrough int64, limit int,
+	updatedAfter, updatedThrough, cursorUpdatedAt, cursorRowID int64, limit int,
 ) ([]omnigentMeta, error) {
 	query := `
 		WITH selected AS (
@@ -619,6 +642,8 @@ func listOmnigentConversationMetasSince(
 			  FROM conversations
 			 WHERE updated_at >= ?
 			   AND updated_at <= ?
+			   AND (updated_at > ? OR
+			        (updated_at = ? AND rowid > ?))
 			 ORDER BY updated_at, rowid
 			 LIMIT ?
 		)
@@ -628,12 +653,7 @@ func listOmnigentConversationMetasSince(
 		  LEFT JOIN conversation_items ci ON ci.conversation_id = c.id
 		 GROUP BY c.id
 		 ORDER BY c.updated_at, c.rowid`
-	if !schema.splitMetadata {
-		return queryOmnigentConversationMetas(
-			ctx, conn, query, updatedAfter, updatedThrough, limit,
-		)
-	}
-	if len(workspaceIDs) == 0 {
+	if schema.splitMetadata {
 		query = `
 			WITH selected AS (
 				SELECT rowid, workspace_id, id,
@@ -641,6 +661,8 @@ func listOmnigentConversationMetasSince(
 				  FROM conversations
 				 WHERE updated_at >= ?
 				   AND updated_at <= ?
+				   AND (updated_at > ? OR
+				        (updated_at = ? AND rowid > ?))
 				 ORDER BY updated_at, rowid
 				 LIMIT ?
 			)
@@ -651,43 +673,11 @@ func listOmnigentConversationMetasSince(
 			    ON ci.workspace_id = c.workspace_id AND ci.conversation_id = c.id
 			 GROUP BY c.workspace_id, c.id
 			 ORDER BY c.updated_at, c.rowid`
-		return queryOmnigentConversationMetas(
-			ctx, conn, query, updatedAfter, updatedThrough, limit,
-		)
 	}
-	query = `
-			WITH selected AS (
-				SELECT rowid, workspace_id, id,
-				       COALESCE(updated_at, 0) AS updated_at
-				  FROM conversations
-				 WHERE workspace_id = ?
-				   AND updated_at >= ?
-				   AND updated_at <= ?
-				 ORDER BY updated_at, rowid
-				 LIMIT ?
-			)
-			SELECT c.rowid, c.workspace_id, c.id, c.updated_at,
-			       COUNT(ci.id), COALESCE(MAX(ci.position), -1)
-			  FROM selected c
-			  LEFT JOIN conversation_items ci
-			    ON ci.workspace_id = c.workspace_id AND ci.conversation_id = c.id
-			 GROUP BY c.workspace_id, c.id
-			 ORDER BY c.updated_at, c.rowid`
-	var metas []omnigentMeta
-	for _, workspaceID := range workspaceIDs {
-		remaining := limit - len(metas)
-		if remaining <= 0 {
-			break
-		}
-		workspaceMetas, err := queryOmnigentConversationMetas(
-			ctx, conn, query, workspaceID, updatedAfter, updatedThrough, remaining,
-		)
-		if err != nil {
-			return nil, err
-		}
-		metas = append(metas, workspaceMetas...)
-	}
-	return metas, nil
+	return queryOmnigentConversationMetas(
+		ctx, conn, query, updatedAfter, updatedThrough,
+		cursorUpdatedAt, cursorUpdatedAt, cursorRowID, limit,
+	)
 }
 
 func queryOmnigentConversationMetas(
@@ -794,9 +784,6 @@ func omnigentStoredSourceMatches(
 		}
 		match, ok := omnigentClassifyPath(root, storedPath, true)
 		if !ok || match.MemberID == "" || !samePath(match.Container, container) {
-			continue
-		}
-		if _, err := omnigentMemberForSchema(schema, match.MemberID); err != nil {
 			continue
 		}
 		matches = append(matches, match)
@@ -950,9 +937,11 @@ func omnigentParseMember(
 	if err != nil {
 		return nil, err
 	}
+	// A member ID that no longer parses under the detected schema is a retired
+	// legacy identity; a nil result retires its archived session.
 	member, err := omnigentMemberForSchema(schema, src.MemberID)
 	if err != nil {
-		return nil, err
+		return nil, nil
 	}
 	return parseOmnigentConversationFromDB(
 		conn, schema, src.Container, member, req.Machine, dbInfo,

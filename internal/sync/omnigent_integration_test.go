@@ -949,7 +949,7 @@ func TestSyncPathsOmnigentSchemaChangeRetiresLegacyArchiveID(t *testing.T) {
 		t.Skip("skipping integration test")
 	}
 	root := t.TempDir()
-	dbPath := writeOmnigentSyncDB(t, root, 1)
+	dbPath := writeOmnigentSyncDB(t, root, 2)
 	archive := dbtest.OpenTestDB(t)
 	engine := sync.NewEngine(archive, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
@@ -961,6 +961,9 @@ func TestSyncPathsOmnigentSchemaChangeRetiresLegacyArchiveID(t *testing.T) {
 	legacy, err := archive.GetSession(context.Background(), "omnigent:conv_0000")
 	require.NoError(t, err)
 	require.NotNil(t, legacy)
+	orphan, err := archive.GetSession(context.Background(), "omnigent:conv_0001")
+	require.NoError(t, err)
+	require.NotNil(t, orphan)
 
 	writer, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
@@ -991,6 +994,10 @@ func TestSyncPathsOmnigentSchemaChangeRetiresLegacyArchiveID(t *testing.T) {
 	legacy, err = archive.GetSession(context.Background(), "omnigent:conv_0000")
 	require.NoError(t, err)
 	assert.Nil(t, legacy)
+	orphan, err = archive.GetSession(context.Background(), "omnigent:conv_0001")
+	require.NoError(t, err)
+	assert.Nil(t, orphan,
+		"a legacy member absent from the new schema must be retired")
 	qualified, err := archive.GetSession(context.Background(), "omnigent:7:conv_0000")
 	require.NoError(t, err)
 	require.NotNil(t, qualified)

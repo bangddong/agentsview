@@ -960,6 +960,62 @@ func TestOmnigentMemberParseDoesNotObserveNewerMetadata(t *testing.T) {
 		"a commit concurrent with parsing must remain visible to the next event")
 }
 
+func TestOmnigentFastChangeWindowPagesPastFirstBatch(t *testing.T) {
+	path := writeOmnigentCardinalityDB(t, 65)
+	root := filepath.Dir(path)
+	tracker := newOmnigentChangeTracker()
+	for range 4 {
+		_, err := tracker.changedMembers(
+			context.Background(), root,
+			ChangedPathRequest{Path: path, EventKind: "poll"},
+		)
+		require.NoError(t, err)
+		tracker.mu.Lock()
+		initializing := tracker.containers[path].initializing
+		tracker.mu.Unlock()
+		if !initializing {
+			break
+		}
+	}
+
+	changedAt := time.Now().Unix()
+	writer, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	_, err = writer.Exec(
+		`UPDATE conversations SET updated_at = ? WHERE rowid <= 12`,
+		changedAt,
+	)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	compositeMTime, err := omnigentDBCompositeMtime(path)
+	require.NoError(t, err)
+	tracker.mu.Lock()
+	tracked := tracker.containers[path]
+	tracked.checkedAt = changedAt
+	tracked.compositeMTimeNS = compositeMTime
+	tracked.probeActive = false
+	tracked.probeRepeat = false
+	tracker.containers[path] = tracked
+	tracker.mu.Unlock()
+
+	seen := make(map[string]struct{})
+	for _, want := range []int{omnigentFastChangedBatchSize, 4} {
+		changed, err := tracker.changedMembers(
+			context.Background(), root,
+			ChangedPathRequest{Path: path, EventKind: "poll"},
+		)
+		require.NoError(t, err)
+		require.Len(t, changed, want)
+		for _, match := range changed {
+			seen[match.MemberID] = struct{}{}
+		}
+	}
+	assert.Len(t, seen, 12)
+	assert.Contains(t, seen, "conv_011",
+		"the keyset cursor must surface changes after the first page")
+}
+
 func writeOmnigentCardinalityDB(t *testing.T, count int) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), omnigentDBName)
