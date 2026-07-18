@@ -5,6 +5,7 @@ package parser
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash"
@@ -104,6 +105,33 @@ type omnigentSchema struct {
 	hasAgentConfig bool
 	// hasSessionUsage is true when a session_usage column is readable.
 	hasSessionUsage bool
+	// binaryIDs is true when id columns hold 16-byte uuid BLOBs (omnigent
+	// migration z7a2b3c4d5e6) rather than text. Queries read them as bare
+	// lowercase hex, the form omnigent's own app layer presents.
+	binaryIDs bool
+}
+
+// omnigentIDExpr yields a SELECT expression reading an id column as text:
+// the raw column for text-id generations, lowercase hex for binary-id ones.
+func omnigentIDExpr(s omnigentSchema, col string) string {
+	if s.binaryIDs {
+		return "LOWER(HEX(" + col + "))"
+	}
+	return col
+}
+
+// omnigentIDArg converts a member raw ID to the bind representation of an id
+// column. A hex-invalid id against a binary-id database binds as text and
+// matches nothing, which retires it as a legacy-generation member.
+func omnigentIDArg(s omnigentSchema, rawID string) any {
+	if !s.binaryIDs {
+		return rawID
+	}
+	decoded, err := hex.DecodeString(rawID)
+	if err != nil {
+		return rawID
+	}
+	return decoded
 }
 
 type omnigentMemberID struct {
@@ -175,6 +203,10 @@ func detectOmnigentSchema(conn *sql.DB) (omnigentSchema, error) {
 	if err != nil {
 		return omnigentSchema{}, err
 	}
+	s.binaryIDs, err = omnigentColumnIsBinary(conn, "conversations", "id")
+	if err != nil {
+		return omnigentSchema{}, err
+	}
 	kindColumn, err := omnigentColumnExists(conn, "conversations", "kind")
 	if err != nil {
 		return omnigentSchema{}, err
@@ -243,6 +275,19 @@ func omnigentColumnIsInteger(
 	return strings.Contains(strings.ToUpper(declType), "INT"), nil
 }
 
+// omnigentColumnIsBinary reports whether a column's declared type is a BLOB
+// (the shape omnigent's Uuid16 columns take on SQLite). Absent columns report
+// false.
+func omnigentColumnIsBinary(
+	conn *sql.DB, table, column string,
+) (bool, error) {
+	declType, ok, err := omnigentColumnType(conn, table, column)
+	if err != nil || !ok {
+		return false, err
+	}
+	return strings.Contains(strings.ToUpper(declType), "BLOB"), nil
+}
+
 func omnigentColumnType(
 	conn *sql.DB, table, column string,
 ) (string, bool, error) {
@@ -296,11 +341,12 @@ func omnigentConversationExists(dbPath, memberKey string) bool {
 	if schema.splitMetadata {
 		err = conn.QueryRow(
 			`SELECT 1 FROM conversations WHERE workspace_id = ? AND id = ? LIMIT 1`,
-			member.workspaceID, member.rawID,
+			member.workspaceID, omnigentIDArg(schema, member.rawID),
 		).Scan(&one)
 	} else {
 		err = conn.QueryRow(
-			`SELECT 1 FROM conversations WHERE id = ? LIMIT 1`, member.rawID,
+			`SELECT 1 FROM conversations WHERE id = ? LIMIT 1`,
+			omnigentIDArg(schema, member.rawID),
 		).Scan(&one)
 	}
 	return err == nil
@@ -336,15 +382,16 @@ func (m omnigentMeta) fingerprint() string {
 func listOmnigentConversationMetas(
 	conn *sql.DB, schema omnigentSchema,
 ) ([]omnigentMeta, error) {
+	idExpr := omnigentIDExpr(schema, "c.id")
 	query := `
-		SELECT c.rowid, 0, c.id, COALESCE(c.updated_at, 0),
+		SELECT c.rowid, 0, ` + idExpr + `, COALESCE(c.updated_at, 0),
 		       COUNT(ci.id), COALESCE(MAX(ci.position), -1)
 		  FROM conversations c
 		  LEFT JOIN conversation_items ci ON ci.conversation_id = c.id
 		 GROUP BY c.id`
 	if schema.splitMetadata {
 		query = `
-			SELECT c.rowid, c.workspace_id, c.id, COALESCE(c.updated_at, 0),
+			SELECT c.rowid, c.workspace_id, ` + idExpr + `, COALESCE(c.updated_at, 0),
 			       COUNT(ci.id), COALESCE(MAX(ci.position), -1)
 			  FROM conversations c
 			  LEFT JOIN conversation_items ci
@@ -399,13 +446,16 @@ func omnigentConvSelect(s omnigentSchema) string {
 			usage = "COALESCE(c.session_usage, '') AS session_usage"
 		}
 	}
+	idExpr := omnigentIDExpr(s, "c.id")
+	rootExpr := omnigentIDExpr(s, "c.root_conversation_id")
+	parentExpr := omnigentIDExpr(s, "c.parent_conversation_id")
 	if !s.splitMetadata {
 		return `
-			SELECT 0, c.id, COALESCE(c.root_conversation_id, ''),
+			SELECT 0, ` + idExpr + `, COALESCE(` + rootExpr + `, ''),
 			       COALESCE(c.created_at, 0), COALESCE(c.updated_at, 0),
 			       COALESCE(c.title, ''), COALESCE(c.kind, ''),
 			       COALESCE(c.model_override, ''),
-			       COALESCE(c.parent_conversation_id, ''),
+			       COALESCE(` + parentExpr + `, ''),
 			       COALESCE(c.sub_agent_name, ''), COALESCE(c.workspace, ''),
 			       COALESCE(c.git_branch, ''), ` + usage + `
 			  FROM conversations c
@@ -422,11 +472,11 @@ func omnigentConvSelect(s omnigentSchema) string {
 		              AND a.conversation_id = c.id`
 	}
 	return `
-		SELECT c.workspace_id, c.id, COALESCE(c.root_conversation_id, ''),
+		SELECT c.workspace_id, ` + idExpr + `, COALESCE(` + rootExpr + `, ''),
 		       COALESCE(c.created_at, 0), COALESCE(c.updated_at, 0),
 		       COALESCE(c.title, ''), COALESCE(CAST(m.kind AS TEXT), ''),
 		       ` + model + `,
-		       COALESCE(c.parent_conversation_id, ''),
+		       COALESCE(` + parentExpr + `, ''),
 		       COALESCE(m.sub_agent_name, ''), COALESCE(m.workspace, ''),
 		       COALESCE(m.git_branch, ''), ` + usage + `
 		  FROM conversations c
@@ -440,9 +490,9 @@ func loadOmnigentConversation(
 	conn *sql.DB, s omnigentSchema, member omnigentMemberID,
 ) (omnigentConversationRow, error) {
 	row := omnigentConversationRow{}
-	args := []any{member.rawID}
+	args := []any{omnigentIDArg(s, member.rawID)}
 	if s.splitMetadata {
-		args = []any{member.workspaceID, member.rawID}
+		args = []any{member.workspaceID, omnigentIDArg(s, member.rawID)}
 	}
 	err := conn.QueryRow(omnigentConvSelect(s), args...).Scan(
 		&row.workspaceID, &row.id, &row.rootID, &row.createdAt, &row.updatedAt, &row.title,
@@ -725,14 +775,14 @@ func loadOmnigentMessages(
 		  FROM conversation_items
 		 WHERE conversation_id = ?
 		 ORDER BY position ASC`
-	args := []any{member.rawID}
+	args := []any{omnigentIDArg(schema, member.rawID)}
 	if schema.splitMetadata {
 		query = `
 			SELECT position, type, COALESCE(data, ''), COALESCE(search_text, '')
 			  FROM conversation_items
 			 WHERE workspace_id = ? AND conversation_id = ?
 			 ORDER BY position ASC`
-		args = []any{member.workspaceID, member.rawID}
+		args = []any{member.workspaceID, omnigentIDArg(schema, member.rawID)}
 	}
 	rows, err := conn.Query(query, args...)
 	if err != nil {

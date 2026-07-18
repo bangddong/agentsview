@@ -287,8 +287,9 @@ to summary-only mode. Set `GROK_DIR` or `grok_dirs` to override the default
 directory.
 
 Omnigent sessions are read from `~/.omnigent/chat.db`. AgentsView creates one
-session per conversation and supports older single-table and newer co-located
-split-table schemas. Set `OMNIGENT_DIR` or `omnigent_dirs` to override the
+session per conversation and supports the older single-table schema, the
+co-located split-table schema, and the current binary-uuid-id schema. Set
+`OMNIGENT_DIR` or `omnigent_dirs` to override the
 default directory. Filesystem-event sync follows Omnigent's `updated_at`
 updates and syncs only the conversations changed or deleted since the last
 sweep. The periodic full sync reconciles direct database edits that do not

@@ -5,6 +5,7 @@ package parser
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -106,6 +107,44 @@ CREATE TABLE conversation_items (
 	position INTEGER NOT NULL, type SMALLINT NOT NULL, status SMALLINT DEFAULT 1,
 	data TEXT NOT NULL, search_text TEXT NOT NULL,
 	PRIMARY KEY (workspace_id, conversation_id, id)
+);
+`
+
+// omnigentBinaryIDGenDDL mirrors the newest omnigent generation (migration
+// z7a2b3c4d5e6): id columns are 16-byte uuid BLOBs, enums are SMALLINT codes,
+// and session metadata is split into omnigent_conversation_metadata.
+const omnigentBinaryIDGenDDL = `
+CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL);
+CREATE TABLE conversations (
+	id BLOB NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+	title VARCHAR(768) DEFAULT ('') NOT NULL,
+	parent_conversation_id BLOB, root_conversation_id BLOB NOT NULL,
+	next_position INTEGER, workspace_id BIGINT DEFAULT '0' NOT NULL,
+	archived BOOLEAN DEFAULT 0 NOT NULL,
+	PRIMARY KEY (workspace_id, id)
+);
+CREATE INDEX ix_conversations_updated_at
+	ON conversations(workspace_id, updated_at, id);
+CREATE TABLE omnigent_conversation_metadata (
+	workspace_id BIGINT DEFAULT '0' NOT NULL, id BLOB NOT NULL,
+	kind SMALLINT NOT NULL, sub_agent_name VARCHAR(128),
+	external_session_id VARCHAR(128), session_usage BLOB,
+	workspace VARCHAR(2048), git_branch VARCHAR(255),
+	PRIMARY KEY (workspace_id, id)
+);
+CREATE TABLE agent_configuration (
+	workspace_id BIGINT DEFAULT '0' NOT NULL, conversation_id BLOB NOT NULL,
+	agent_id BLOB, reasoning_effort VARCHAR(32),
+	model_override VARCHAR(128), harness_override VARCHAR(64),
+	PRIMARY KEY (workspace_id, conversation_id)
+);
+CREATE TABLE conversation_items (
+	id BLOB NOT NULL, conversation_id BLOB NOT NULL,
+	response_id VARCHAR(64) NOT NULL, created_at INTEGER NOT NULL,
+	position INTEGER NOT NULL, type SMALLINT NOT NULL,
+	status SMALLINT NOT NULL, data TEXT NOT NULL, search_text TEXT NOT NULL,
+	workspace_id BIGINT DEFAULT '0' NOT NULL,
+	PRIMARY KEY (workspace_id, conversation_id, id, created_at)
 );
 `
 
@@ -804,6 +843,186 @@ func writeOmnigentSplitWorkspaceCardinalityDB(t *testing.T, count int) string {
 	}
 	require.NoError(t, database.Close())
 	return path
+}
+
+// omnigentHexBytes decodes a 32-char hex conversation ID into the 16 raw
+// bytes the binary-id generation stores.
+func omnigentHexBytes(t *testing.T, hexID string) []byte {
+	t.Helper()
+	decoded, err := hex.DecodeString(hexID)
+	require.NoError(t, err)
+	return decoded
+}
+
+const (
+	omnigentBinaryConvHex   = "3ca53ab9e60540a8aef3c1f152555889"
+	omnigentBinarySubHex    = "cf1eb494e015495abebd096b3ff3ab5e"
+	omnigentBinaryGoneHex   = "d6a78eb8cd7e4a6080f3ebef4346168a"
+	omnigentBinaryItemHexA  = "00000000000000000000000000000001"
+	omnigentBinaryItemHexB  = "00000000000000000000000000000002"
+	omnigentBinaryItemHexC  = "00000000000000000000000000000003"
+	omnigentBinaryItemHexD  = "00000000000000000000000000000004"
+	omnigentBinaryItemHexE  = "00000000000000000000000000000005"
+	omnigentBinaryAgentHex  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	omnigentBinaryUsageJSON = `{"input_tokens":1500,"output_tokens":350,` +
+		`"by_model":{"omnigent-large":{"input_tokens":1500,"output_tokens":350}}}`
+)
+
+// writeOmnigentBinaryIDDB builds a newest-generation database: BLOB uuid ids,
+// int enum codes, split metadata, framed session_usage, and a sub-agent child.
+func writeOmnigentBinaryIDDB(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), omnigentDBName)
+	database, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	execOmnigentDDL(t, database, omnigentBinaryIDGenDDL)
+	_, err = database.Exec(`INSERT INTO alembic_version VALUES ('d1e2f3a4b5c6')`)
+	require.NoError(t, err)
+
+	conv := omnigentHexBytes(t, omnigentBinaryConvHex)
+	sub := omnigentHexBytes(t, omnigentBinarySubHex)
+	insertConv := func(id, parent, root []byte, title string, updatedAt int64) {
+		_, err = database.Exec(`INSERT INTO conversations
+			(id, created_at, updated_at, title, parent_conversation_id,
+			 root_conversation_id)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			id, updatedAt-1, updatedAt, title, parent, root)
+		require.NoError(t, err)
+	}
+	insertConv(conv, nil, conv, "Fix the flaky retry test", 1_700_000_010)
+	insertConv(sub, conv, conv, "explore:codebase-map", 1_700_000_011)
+
+	// session_usage uses the compression framing: sentinel + raw codec.
+	framedUsage := append([]byte{0x00, 0x00}, []byte(omnigentBinaryUsageJSON)...)
+	_, err = database.Exec(`INSERT INTO omnigent_conversation_metadata
+		(id, kind, workspace, git_branch, session_usage)
+		VALUES (?, 1, '/home/dev/projects/sample', 'main', ?)`,
+		conv, framedUsage)
+	require.NoError(t, err)
+	_, err = database.Exec(`INSERT INTO omnigent_conversation_metadata
+		(id, kind, sub_agent_name, workspace)
+		VALUES (?, 2, 'explorer', '/home/dev/projects/sample')`, sub)
+	require.NoError(t, err)
+	_, err = database.Exec(`INSERT INTO agent_configuration
+		(conversation_id, agent_id, model_override)
+		VALUES (?, ?, 'omnigent-large')`,
+		conv, omnigentHexBytes(t, omnigentBinaryAgentHex))
+	require.NoError(t, err)
+
+	insertItem := func(convID []byte, itemHex string, position, typeCode int, data, search string) {
+		_, err = database.Exec(`INSERT INTO conversation_items
+			(id, conversation_id, response_id, created_at, position, type,
+			 status, data, search_text)
+			VALUES (?, ?, 'resp_001', 1700000010, ?, ?, 1, ?, ?)`,
+			omnigentHexBytes(t, itemHex), convID, position, typeCode, data, search)
+		require.NoError(t, err)
+	}
+	insertItem(conv, omnigentBinaryItemHexA, 0, 1,
+		`{"role":"user","content":[{"type":"input_text","text":"Why is the retry test flaky?"}]}`,
+		"Why is the retry test flaky?")
+	insertItem(conv, omnigentBinaryItemHexB, 1, 2,
+		`{"model":"omnigent-large","name":"shell.run","arguments":"{\"cmd\":\"go test\"}","call_id":"call_abc123"}`,
+		"")
+	insertItem(conv, omnigentBinaryItemHexC, 2, 3,
+		`{"call_id":"call_abc123","output":"--- FAIL: TestRetry"}`,
+		"")
+	insertItem(conv, omnigentBinaryItemHexD, 3, 1,
+		`{"role":"assistant","model":"omnigent-large","content":[{"type":"output_text","text":"Raise the timeout."}]}`,
+		"Raise the timeout.")
+	insertItem(sub, omnigentBinaryItemHexE, 0, 1,
+		`{"role":"user","content":[{"type":"input_text","text":"Map the retry package"}]}`,
+		"Map the retry package")
+
+	require.NoError(t, database.Close())
+	return path
+}
+
+func TestOmnigentBinaryIDGenerationParses(t *testing.T) {
+	path := writeOmnigentBinaryIDDB(t)
+	provider, ok := NewProvider(AgentOmnigent, ProviderConfig{
+		Roots: []string{filepath.Dir(path)}, Machine: "host",
+	})
+	require.True(t, ok)
+
+	sources, err := provider.Discover(context.Background())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	outcome, err := provider.Parse(
+		context.Background(), ParseRequest{Source: sources[0]},
+	)
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 2)
+	assert.True(t, outcome.ResultSetComplete)
+
+	byID := map[string]ParseResult{}
+	for _, res := range outcome.Results {
+		byID[res.Result.Session.ID] = res.Result
+	}
+	main, ok := byID[omnigentIDPrefix+"0:"+omnigentBinaryConvHex]
+	require.True(t, ok, "main conversation must parse under its hex ID")
+	assert.Equal(t, "Fix the flaky retry test", main.Session.SessionName)
+	require.Len(t, main.Messages, 3,
+		"function_call_output must fold onto its call")
+	assert.Equal(t, "main", main.Session.GitBranch)
+	require.Len(t, main.UsageEvents, 1,
+		"framed session_usage must decode into usage events")
+	assert.Equal(t, "omnigent-large", main.UsageEvents[0].Model)
+
+	sub, ok := byID[omnigentIDPrefix+"0:"+omnigentBinarySubHex]
+	require.True(t, ok, "sub-agent conversation must parse under its hex ID")
+	assert.Equal(t, omnigentIDPrefix+"0:"+omnigentBinaryConvHex,
+		sub.Session.ParentSessionID,
+		"parent linkage must survive the binary-id hex conversion")
+}
+
+func TestOmnigentBinaryIDChangedPathSweepAndTombstones(t *testing.T) {
+	path := writeOmnigentBinaryIDDB(t)
+	conn, err := openOmnigentDB(path)
+	require.NoError(t, err)
+	schema, err := detectOmnigentSchema(conn)
+	require.NoError(t, err)
+	require.True(t, schema.binaryIDs)
+	require.NoError(t, conn.Close())
+
+	tracker := newOmnigentChangeTracker()
+	tracker.containers[path] = omnigentTrackedContainer{
+		schema: schema, checkedAt: time.Now().Unix(),
+	}
+	writer, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	_, err = writer.Exec(`UPDATE conversations SET updated_at = ? WHERE id = ?`,
+		time.Now().Unix(), omnigentHexBytes(t, omnigentBinaryConvHex))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	changed, err := tracker.changedMembers(
+		context.Background(), filepath.Dir(path), ChangedPathRequest{
+			Path: path, EventKind: "write",
+			StoredSourcePaths: []string{
+				VirtualSourcePath(path, "0:"+omnigentBinaryConvHex),
+				VirtualSourcePath(path, "0:"+omnigentBinarySubHex),
+				VirtualSourcePath(path, "0:"+omnigentBinaryGoneHex),
+			},
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, changed, 2,
+		"one changed member plus one deleted-member tombstone")
+	assert.Equal(t, "0:"+omnigentBinaryConvHex, changed[0].MemberID)
+	assert.Equal(t, "0:"+omnigentBinaryGoneHex, changed[1].MemberID)
+}
+
+func TestOmnigentShmEventDoesNotResolveToContainer(t *testing.T) {
+	path := writeOmnigentBinaryIDDB(t)
+	root := filepath.Dir(path)
+
+	_, ok := omnigentClassifyPath(root, path+"-shm", true)
+	assert.False(t, ok,
+		"-shm events come from the provider's own read connections and "+
+			"must not schedule a sweep")
+	match, ok := omnigentClassifyPath(root, path+"-wal", true)
+	require.True(t, ok, "-wal events carry real commits")
+	assert.Equal(t, path, match.Container)
 }
 
 func omnigentMetaByID(metas []omnigentMeta, id string) omnigentMeta {

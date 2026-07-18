@@ -245,24 +245,25 @@ func omnigentFingerprintSource(src multiSessionSource) (SourceFingerprint, error
 func loadOmnigentConversationMeta(
 	conn *sql.DB, schema omnigentSchema, member omnigentMemberID,
 ) (omnigentMeta, bool, error) {
+	idExpr := omnigentIDExpr(schema, "c.id")
 	query := `
-		SELECT c.rowid, 0, c.id, COALESCE(c.updated_at, 0),
+		SELECT c.rowid, 0, ` + idExpr + `, COALESCE(c.updated_at, 0),
 		       COUNT(ci.id), COALESCE(MAX(ci.position), -1)
 		  FROM conversations c
 		  LEFT JOIN conversation_items ci ON ci.conversation_id = c.id
 		 WHERE c.id = ?
 		 GROUP BY c.id`
-	args := []any{member.rawID}
+	args := []any{omnigentIDArg(schema, member.rawID)}
 	if schema.splitMetadata {
 		query = `
-			SELECT c.rowid, c.workspace_id, c.id, COALESCE(c.updated_at, 0),
+			SELECT c.rowid, c.workspace_id, ` + idExpr + `, COALESCE(c.updated_at, 0),
 			       COUNT(ci.id), COALESCE(MAX(ci.position), -1)
 			  FROM conversations c
 			  LEFT JOIN conversation_items ci
 			    ON ci.workspace_id = c.workspace_id AND ci.conversation_id = c.id
 			 WHERE c.workspace_id = ? AND c.id = ?
 			 GROUP BY c.workspace_id, c.id`
-		args = []any{member.workspaceID, member.rawID}
+		args = []any{member.workspaceID, omnigentIDArg(schema, member.rawID)}
 	}
 	var meta omnigentMeta
 	err := conn.QueryRow(query, args...).Scan(
@@ -337,6 +338,7 @@ func listOmnigentConversationMetasSince(
 	ctx context.Context, conn *sql.DB, schema omnigentSchema,
 	updatedAfter, updatedThrough int64,
 ) ([]omnigentMeta, error) {
+	idExpr := omnigentIDExpr(schema, "c.id")
 	query := `
 		WITH selected AS (
 			SELECT rowid, id, COALESCE(updated_at, 0) AS updated_at
@@ -344,7 +346,7 @@ func listOmnigentConversationMetasSince(
 			 WHERE updated_at >= ?
 			   AND updated_at <= ?
 		)
-		SELECT c.rowid, 0, c.id, c.updated_at,
+		SELECT c.rowid, 0, ` + idExpr + `, c.updated_at,
 		       COUNT(ci.id), COALESCE(MAX(ci.position), -1)
 		  FROM selected c
 		  LEFT JOIN conversation_items ci ON ci.conversation_id = c.id
@@ -359,7 +361,7 @@ func listOmnigentConversationMetasSince(
 				 WHERE updated_at >= ?
 				   AND updated_at <= ?
 			)
-			SELECT c.rowid, c.workspace_id, c.id, c.updated_at,
+			SELECT c.rowid, c.workspace_id, ` + idExpr + `, c.updated_at,
 			       COUNT(ci.id), COALESCE(MAX(ci.position), -1)
 			  FROM selected c
 			  LEFT JOIN conversation_items ci
@@ -466,9 +468,10 @@ func omnigentDeletedMemberTombstones(
 func listOmnigentMemberKeys(
 	ctx context.Context, conn *sql.DB, schema omnigentSchema,
 ) (map[string]struct{}, error) {
-	query := `SELECT 0, id FROM conversations`
+	idExpr := omnigentIDExpr(schema, "id")
+	query := `SELECT 0, ` + idExpr + ` FROM conversations`
 	if schema.splitMetadata {
-		query = `SELECT workspace_id, id FROM conversations`
+		query = `SELECT workspace_id, ` + idExpr + ` FROM conversations`
 	}
 	rows, err := conn.QueryContext(ctx, query)
 	if err != nil {
@@ -623,6 +626,13 @@ func omnigentDBUnderRoot(root, dbPath string, requireRegular bool) bool {
 func omnigentDBPathForEvent(root, path string) (string, bool) {
 	root = filepath.Clean(root)
 	path = filepath.Clean(path)
+	// The provider's own read connections update the WAL shared-memory
+	// file's mtime, so treating -shm events as source changes would make
+	// every sweep trigger the next one, a permanent watcher loop. Real
+	// commits always touch the database file or -wal as well.
+	if strings.HasSuffix(path, "-shm") {
+		return "", false
+	}
 	rel, ok := relUnder(root, path)
 	if !ok {
 		return "", false
