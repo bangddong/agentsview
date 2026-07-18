@@ -57,8 +57,6 @@ type omnigentParseCountingProvider struct {
 	failOnce *atomic.Bool
 }
 
-const omnigentMemberBatchForTest = 32
-
 func (p *omnigentParseCountingProvider) Parse(
 	ctx context.Context, req parser.ParseRequest,
 ) (parser.ParseOutcome, error) {
@@ -266,28 +264,17 @@ func TestSyncOmnigentChangedPathWorkIsBounded(t *testing.T) {
 			require.NoError(t, tx.Commit())
 			require.NoError(t, writer.Close())
 
-			var deleted *db.Session
-			var replacement *db.Session
-			maxPasses := 2*(archiveSize+omnigentMemberBatchForTest-1)/omnigentMemberBatchForTest + 3
-			for pass := range maxPasses {
-				if pass == 0 {
-					engine.SyncPaths([]string{dbPath})
-				} else {
-					engine.SyncAll(context.Background(), nil)
-				}
-				deleted, err = archive.GetSession(
-					context.Background(), "omnigent:conv_0001")
-				require.NoError(t, err)
-				replacement, err = archive.GetSession(
-					context.Background(), "omnigent:replacement")
-				require.NoError(t, err)
-				if deleted == nil && replacement != nil {
-					break
-				}
-			}
+			engine.SyncPaths([]string{dbPath})
+			deleted, err := archive.GetSession(
+				context.Background(), "omnigent:conv_0001")
+			require.NoError(t, err)
 			assert.Nil(t, deleted,
-				"bounded rotating probes should eventually retire a deleted conversation")
-			require.NotNil(t, replacement)
+				"one changed-path pass must tombstone an in-place deletion")
+			replacement, err := archive.GetSession(
+				context.Background(), "omnigent:replacement")
+			require.NoError(t, err)
+			require.NotNil(t, replacement,
+				"one changed-path pass must sync the replacement conversation")
 		})
 	}
 }
@@ -375,9 +362,12 @@ func TestSyncOmnigentFullSyncWritesOnlyChangedMembers(t *testing.T) {
 			syncOmnigentArchive(t, engine, archive, archiveSize)
 
 			parseCount.Store(0)
+			resultCount.Store(0)
 			engine.SyncAll(context.Background(), nil)
 			assert.Zero(t, parseCount.Load(),
 				"an unchanged container must be skipped without parsing")
+			assert.Zero(t, resultCount.Load(),
+				"an unchanged container must emit no results")
 
 			writer, err := sql.Open("sqlite3", dbPath)
 			require.NoError(t, err)
@@ -391,9 +381,16 @@ func TestSyncOmnigentFullSyncWritesOnlyChangedMembers(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, writer.Close())
 
+			parseCount.Store(0)
+			resultCount.Store(0)
 			engine.SyncAll(context.Background(), nil)
 			assert.Equal(t, 1, engine.LastSyncStats().Synced,
 				"only the changed member may be rewritten")
+			assert.Equal(t, int64(1), parseCount.Load(),
+				"a changed container costs one whole-container parse")
+			assert.Equal(t, int64(archiveSize), resultCount.Load(),
+				"the full parse re-emits every member; write dedup, "+
+					"not result count, bounds the work that persists")
 
 			deletedID := "conv_0001"
 			writer, err = sql.Open("sqlite3", dbPath)
@@ -405,9 +402,13 @@ func TestSyncOmnigentFullSyncWritesOnlyChangedMembers(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, writer.Close())
 
+			parseCount.Store(0)
+			resultCount.Store(0)
 			engine.SyncAll(context.Background(), nil)
 			assert.Zero(t, engine.LastSyncStats().Synced,
 				"reconciling a deletion must not rewrite surviving members")
+			assert.Equal(t, int64(archiveSize-1), resultCount.Load(),
+				"reconciliation re-emits the surviving membership")
 			deleted, err := archive.GetSession(
 				context.Background(), "omnigent:"+deletedID)
 			require.NoError(t, err)
