@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -13,6 +14,69 @@ import (
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/pricing"
 )
+
+func TestActivityProjectReclassificationCandidatesEndpointUsesReportSelection(t *testing.T) {
+	te := setup(t)
+	const rawProject = "branch-label"
+	seed := func(id, machine, started string) {
+		ended := started
+		te.seedSession(t, id, rawProject, 1, func(s *db.Session) {
+			s.Machine = machine
+			s.Cwd = "/srv/worktrees/example/" + id
+			s.StartedAt = &started
+			s.EndedAt = &ended
+		})
+	}
+	seed("selected", "host-a.example", activityDate+"T10:00:00Z")
+	seed("wrong-machine", "host-b.example", activityDate+"T10:00:00Z")
+	seed("outside-range", "host-a.example", "2025-06-03T10:00:00Z")
+
+	projects, err := te.db.BuildProjectIdentityMap(context.Background(), []string{rawProject})
+	require.NoError(t, err)
+	w := te.get(t, buildPathURL(
+		"/api/v1/activity/project-reclassification/candidates",
+		map[string]string{
+			"preset": "day", "date": activityDate, "timezone": "UTC",
+			"machine": "host-a.example", "project": rawProject,
+			"automation": "all", "clicked_project": rawProject,
+			"clicked_project_key": projects[rawProject].ProjectKey,
+		},
+	))
+	assertStatus(t, w, http.StatusOK)
+	var response struct {
+		Candidates []db.WorktreeReclassificationCandidate `json:"candidates"`
+	}
+	decodeInto(t, w, &response)
+	require.Len(t, response.Candidates, 1)
+	assert.Equal(t, "host-a.example", response.Candidates[0].Machine)
+	assert.Equal(t, 1, response.Candidates[0].ContributingSessions)
+	assert.Equal(t, "/srv/worktrees/example/selected",
+		response.Candidates[0].SuggestedPrefix)
+}
+
+func TestActivityProjectReclassificationCandidatesEndpointValidationAndReadOnly(t *testing.T) {
+	te := setup(t)
+	for _, key := range []string{"", "   "} {
+		w := te.get(t, buildPathURL(
+			"/api/v1/activity/project-reclassification/candidates",
+			map[string]string{
+				"preset": "day", "date": activityDate, "timezone": "UTC",
+				"clicked_project": "example", "clicked_project_key": key,
+			},
+		))
+		assertStatus(t, w, http.StatusBadRequest)
+	}
+
+	remote := setupPGMode(t)
+	w := remote.get(t, buildPathURL(
+		"/api/v1/activity/project-reclassification/candidates",
+		map[string]string{
+			"preset": "day", "date": activityDate, "timezone": "UTC",
+			"clicked_project": "example", "clicked_project_key": "pl1-example",
+		},
+	))
+	assertStatus(t, w, http.StatusNotImplemented)
+}
 
 // activityDate is a fixed past calendar day so the activity report is
 // deterministic and complete (non-partial) regardless of wall clock.

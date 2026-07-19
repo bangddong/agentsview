@@ -3,10 +3,117 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ActivityReport } from '../models/ActivityReport';
+import type { WorktreeCandidatesResponse } from '../models/WorktreeCandidatesResponse';
 import type { CancelablePromise } from '../core/CancelablePromise';
 import { OpenAPI } from '../core/OpenAPI';
 import { request as __request } from '../core/request';
 export class ActivityService {
+  /**
+   * List project reclassification candidates
+   * @returns WorktreeCandidatesResponse OK
+   * @throws ApiError
+   */
+  public static getApiV1ActivityProjectReclassificationCandidates({
+    preset,
+    date,
+    from,
+    to,
+    timezone,
+    bucket,
+    project,
+    gitBranch,
+    agent,
+    machine,
+    automation = 'all',
+    clickedProject,
+    clickedProjectKey,
+  }: {
+    /**
+     * Range preset
+     */
+    preset?: 'day' | 'week' | 'month' | 'custom',
+    /**
+     * Calendar day (YYYY-MM-DD) for presets
+     */
+    date?: string,
+    /**
+     * Range start (RFC3339) for custom ranges
+     */
+    from?: string,
+    /**
+     * Range end (RFC3339) for custom ranges
+     */
+    to?: string,
+    /**
+     * IANA timezone name
+     */
+    timezone?: string,
+    /**
+     * Timeline bucket size override
+     */
+    bucket?: '5m' | '15m' | '1h' | '1d' | '1w',
+    /**
+     * Current Activity project filter
+     */
+    project?: string,
+    /**
+     * Current Activity git branch filter
+     */
+    gitBranch?: string,
+    /**
+     * Current Activity agent filter
+     */
+    agent?: string,
+    /**
+     * Current Activity machine filter
+     */
+    machine?: string,
+    /**
+     * Automation class
+     */
+    automation?: string,
+    /**
+     * Clicked project display label
+     */
+    clickedProject?: string,
+    /**
+     * Opaque clicked project identity
+     */
+    clickedProjectKey?: string,
+  }): CancelablePromise<WorktreeCandidatesResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/api/v1/activity/project-reclassification/candidates',
+      query: {
+        'preset': preset,
+        'date': date,
+        'from': from,
+        'to': to,
+        'timezone': timezone,
+        'bucket': bucket,
+        'project': project,
+        'git_branch': gitBranch,
+        'agent': agent,
+        'machine': machine,
+        'automation': automation,
+        'clicked_project': clickedProject,
+        'clicked_project_key': clickedProjectKey,
+      },
+      errors: {
+        400: `Bad Request`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Not Found`,
+        409: `Conflict`,
+        422: `Unprocessable Entity`,
+        500: `Internal Server Error`,
+        501: `Not Implemented`,
+        502: `Bad Gateway`,
+        503: `Service Unavailable`,
+        504: `Gateway Timeout`,
+      },
+    });
+  }
   /**
    * Get activity report
    * @returns ActivityReport OK

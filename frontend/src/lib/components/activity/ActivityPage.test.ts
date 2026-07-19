@@ -1,11 +1,5 @@
 // @vitest-environment jsdom
-import {
-  afterEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { fireEvent, screen } from "@testing-library/svelte";
 import { mount, tick, unmount } from "svelte";
 import { activity } from "../../stores/activity.svelte.js";
@@ -14,6 +8,9 @@ import { yokedDates } from "../../stores/yokedDates.svelte.js";
 import source from "./ActivityPage.svelte?raw";
 // @ts-ignore
 import ActivityPage from "./ActivityPage.svelte";
+import { ActivityService, SettingsService } from "../../api/generated/index";
+import { sync } from "../../stores/sync.svelte.js";
+import type { Report } from "../../api/types.js";
 
 async function flushEffects() {
   await tick();
@@ -30,13 +27,62 @@ function stubActivityPageCollaborators() {
     },
   );
   vi.spyOn(activity, "attach").mockReturnValue(() => {});
-  vi.spyOn(activity, "loadFilterOptions").mockResolvedValue();
-  vi.spyOn(activity, "load").mockResolvedValue();
+  vi.spyOn(activity, "loadFilterOptions").mockResolvedValue(true);
+  vi.spyOn(activity, "load").mockResolvedValue(true);
 }
 
 async function openCalendar(triggerLabel: string) {
   await fireEvent.click(screen.getByRole("button", { name: triggerLabel }));
   await fireEvent.click(screen.getByRole("radio", { name: "Calendar" }));
+}
+
+function projectReport(): Report {
+  return {
+    timezone: "UTC",
+    range_start: "2026-07-01T00:00:00Z",
+    range_end: "2026-07-02T00:00:00Z",
+    bucket_unit: "hour",
+    bucket_seconds: 3600,
+    bucket_count: 24,
+    partial: false,
+    as_of: null,
+    effective_end: "2026-07-02T00:00:00Z",
+    elapsed_bucket_count: 24,
+    buckets: [],
+    peak: { agents: 0, at: null },
+    totals: {
+      active_minutes: 0,
+      idle_minutes: 0,
+      agent_minutes: 20,
+      sessions: 1,
+      untimed_sessions: 0,
+      distinct_projects: 1,
+      distinct_models: 0,
+      output_tokens: 0,
+      cost: 0,
+      automated_agent_minutes: 0,
+      automated_cost: 0,
+      automated_sessions: 0,
+      interactive_agent_minutes: 20,
+      interactive_cost: 0,
+      interactive_sessions: 1,
+    },
+    by_project: [{
+      key: "wrong-project",
+      project_key: "pl1:sha256:wrong",
+      agent_minutes: 20,
+      cost: 0,
+      interactive_agent_minutes: 20,
+      automated_agent_minutes: 0,
+      interactive_cost: 0,
+      automated_cost: 0,
+    }],
+    by_model: [],
+    by_agent: [],
+    by_session: [],
+    intervals: [],
+    projects: {},
+  } as Report;
 }
 
 function calendarDay(label: string): HTMLButtonElement {
@@ -52,6 +98,238 @@ describe("ActivityPage refresh control layout", () => {
   });
 });
 
+describe("ActivityPage project reclassification", () => {
+  let component: ReturnType<typeof mount> | undefined;
+
+  afterEach(() => {
+    if (component) unmount(component);
+    component = undefined;
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.report = null;
+    activity.projects = [];
+    sync.serverVersion = null;
+  });
+
+  it("opens the page-owned modal with the exact clicked project scope", async () => {
+    stubActivityPageCollaborators();
+    sync.serverVersion = null;
+    activity.report = {
+      timezone: "UTC",
+      range_start: "2026-07-01T00:00:00Z",
+      range_end: "2026-07-02T00:00:00Z",
+      bucket_unit: "hour",
+      bucket_seconds: 3600,
+      bucket_count: 24,
+      partial: false,
+      as_of: null,
+      effective_end: "2026-07-02T00:00:00Z",
+      elapsed_bucket_count: 24,
+      buckets: [],
+      peak: { agents: 0, at: null },
+      totals: {
+        active_minutes: 0,
+        idle_minutes: 0,
+        agent_minutes: 20,
+        sessions: 1,
+        untimed_sessions: 0,
+        distinct_projects: 1,
+        distinct_models: 0,
+        output_tokens: 0,
+        cost: 0,
+        automated_agent_minutes: 0,
+        automated_cost: 0,
+        automated_sessions: 0,
+        interactive_agent_minutes: 20,
+        interactive_cost: 0,
+        interactive_sessions: 1,
+      },
+      by_project: [
+        {
+          key: "wrong-project",
+          project_key: "pl1:sha256:wrong",
+          agent_minutes: 20,
+          cost: 0,
+          interactive_agent_minutes: 20,
+          automated_agent_minutes: 0,
+          interactive_cost: 0,
+          automated_cost: 0,
+        },
+      ],
+      by_model: [],
+      by_agent: [],
+      by_session: [],
+      intervals: [],
+      projects: {},
+    } as Report;
+    vi.spyOn(
+      ActivityService,
+      "getApiV1ActivityProjectReclassificationCandidates",
+    ).mockResolvedValue({ candidates: [] } as never);
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    const action = screen.getByRole("button", {
+      name: "Reclassify project wrong-project",
+    });
+    expect(action.getAttribute("aria-disabled")).toBe("true");
+    expect((action as HTMLButtonElement).title).toBe(
+      "Reclassify project wrong-project",
+    );
+    await fireEvent.click(action);
+    expect(
+      ActivityService.getApiV1ActivityProjectReclassificationCandidates,
+    ).not.toHaveBeenCalled();
+
+    sync.serverVersion = { read_only: false } as unknown as NonNullable<
+      typeof sync.serverVersion
+    >;
+    await flushEffects();
+    await fireEvent.click(action);
+    await flushEffects();
+
+    expect(screen.getByRole("dialog", { name: "Reclassify project" })).toBeTruthy();
+    expect(screen.getByText("Originally shown as wrong-project")).toBeTruthy();
+    expect(ActivityService.getApiV1ActivityProjectReclassificationCandidates).toHaveBeenCalledWith(
+      expect.objectContaining({
+        clickedProject: "wrong-project",
+        clickedProjectKey: "pl1:sha256:wrong",
+      }),
+    );
+  });
+
+  it("returns focus to the project action after apply and explicit refresh", async () => {
+    stubActivityPageCollaborators();
+    sync.serverVersion = { read_only: false } as unknown as NonNullable<
+      typeof sync.serverVersion
+    >;
+    activity.report = projectReport();
+    activity.projects = [{ name: "target-project", session_count: 2 }];
+    vi.spyOn(
+      ActivityService,
+      "getApiV1ActivityProjectReclassificationCandidates",
+    ).mockResolvedValue({
+      candidates: [{
+        id: "candidate-1",
+        machine: "remote.example",
+        suggested_prefix: "/srv/worktrees/example/repo/branch",
+        contributing_sessions: 1,
+        distinct_cwds: 1,
+        evidence_kind: "identity",
+        examples: [],
+        available: true,
+      }],
+    } as never);
+    vi.spyOn(
+      SettingsService,
+      "postApiV1SettingsWorktreeMappingsPreview",
+    ).mockResolvedValue({
+      mapping_token: "token-1",
+      normalized_project: "target-project",
+      matched_sessions: 1,
+      updated_sessions: 1,
+      distinct_projects: 1,
+      project_samples: [],
+      session_samples: [],
+    } as never);
+    vi.spyOn(
+      SettingsService,
+      "postApiV1SettingsWorktreeMappingsReclassify",
+    ).mockResolvedValue({ mapping: {}, result: {} } as never);
+    vi.spyOn(activity, "refreshAfterReclassification").mockResolvedValue(true);
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    const trigger = screen.getByRole("button", {
+      name: "Reclassify project wrong-project",
+    });
+    await fireEvent.click(trigger);
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Target project"));
+    await fireEvent.mouseDown(
+      screen.getByRole("option", { name: "target-project (2)" }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 320));
+    await flushEffects();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Apply reclassification" }),
+    );
+    await flushEffects();
+
+    expect(SettingsService.postApiV1SettingsWorktreeMappingsReclassify).toHaveBeenCalledTimes(1);
+    expect(activity.refreshAfterReclassification).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("dialog", { name: "Reclassify project" })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("returns focus to the Project heading when refresh removes the triggering row", async () => {
+    stubActivityPageCollaborators();
+    sync.serverVersion = { read_only: false } as unknown as NonNullable<
+      typeof sync.serverVersion
+    >;
+    activity.report = projectReport();
+    activity.projects = [{ name: "target-project", session_count: 2 }];
+    vi.spyOn(
+      ActivityService,
+      "getApiV1ActivityProjectReclassificationCandidates",
+    ).mockResolvedValue({
+      candidates: [{
+        id: "candidate-1",
+        machine: "remote.example",
+        suggested_prefix: "/srv/worktrees/example/repo/branch",
+        contributing_sessions: 1,
+        distinct_cwds: 1,
+        evidence_kind: "identity",
+        examples: [],
+        available: true,
+      }],
+    } as never);
+    vi.spyOn(
+      SettingsService,
+      "postApiV1SettingsWorktreeMappingsPreview",
+    ).mockResolvedValue({
+      mapping_token: "token-1",
+      normalized_project: "target-project",
+      matched_sessions: 1,
+      updated_sessions: 1,
+      distinct_projects: 1,
+      project_samples: [],
+      session_samples: [],
+    } as never);
+    vi.spyOn(
+      SettingsService,
+      "postApiV1SettingsWorktreeMappingsReclassify",
+    ).mockResolvedValue({ mapping: {}, result: {} } as never);
+    vi.spyOn(activity, "refreshAfterReclassification").mockImplementation(async () => {
+      activity.report = { ...projectReport(), by_project: [] } as Report;
+      return true;
+    });
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    const trigger = screen.getByRole("button", {
+      name: "Reclassify project wrong-project",
+    });
+    await fireEvent.click(trigger);
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Target project"));
+    await fireEvent.mouseDown(
+      screen.getByRole("option", { name: "target-project (2)" }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 320));
+    await flushEffects();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Apply reclassification" }),
+    );
+    await flushEffects();
+
+    const projectHeading = screen.getByRole("heading", { name: "Project" });
+    expect(trigger.isConnected).toBe(false);
+    expect(document.activeElement).toBe(projectHeading);
+  });
+});
+
 describe("ActivityPage date yoke controls", () => {
   it("updates shared yoke state from the unified range picker", () => {
     expect(source).toContain("<RangePicker");
@@ -62,12 +340,8 @@ describe("ActivityPage date yoke controls", () => {
   it("yokes week and month selections using resolved period starts", () => {
     expect(source).toContain("startOfIsoWeek(activity.date)");
     expect(source).toContain("startOfMonth(activity.date)");
-    expect(source).not.toContain(
-      "panelDateState(activity.date, addDays(activity.date, 6)",
-    );
-    expect(source).not.toContain(
-      "panelDateState(activity.date, endOfMonth(activity.date)",
-    );
+    expect(source).not.toContain("panelDateState(activity.date, addDays(activity.date, 6)");
+    expect(source).not.toContain("panelDateState(activity.date, endOfMonth(activity.date)");
   });
 
   it("preserves relative range selections as rolling yoke state", () => {
@@ -127,14 +401,14 @@ describe("ActivityPage date yoke integration", () => {
       },
     );
     vi.spyOn(activity, "attach").mockReturnValue(() => {});
-    vi.spyOn(activity, "loadFilterOptions").mockResolvedValue();
+    vi.spyOn(activity, "loadFilterOptions").mockResolvedValue(true);
     vi.spyOn(activity, "load").mockImplementation(() => {
       loadStates.push({
         preset: activity.preset,
         from: activity.from,
         to: activity.to,
       });
-      return Promise.resolve();
+      return Promise.resolve(true);
     });
     router.route = "activity";
     router.params = {};

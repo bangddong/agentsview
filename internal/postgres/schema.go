@@ -85,6 +85,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     runaway_tool_loop_count   INT NOT NULL DEFAULT 0,
     termination_status        TEXT,
     transcript_revision       TEXT NOT NULL DEFAULT '0',
+    source_archive_id  TEXT NOT NULL DEFAULT '',
+    file_path          TEXT,
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -296,6 +298,18 @@ CREATE INDEX IF NOT EXISTS idx_source_session_project_identity_snapshots_project
     ON source_session_project_identity_snapshots (
         source_archive_id, project
     );
+
+CREATE TABLE IF NOT EXISTS source_worktree_project_mappings (
+    source_archive_id TEXT NOT NULL,
+    machine           TEXT NOT NULL,
+    path_prefix       TEXT NOT NULL,
+    layout            TEXT NOT NULL DEFAULT 'explicit',
+    project           TEXT NOT NULL DEFAULT '',
+    original_project  TEXT NOT NULL DEFAULT '',
+    enabled           BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at        TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (source_archive_id, machine, path_prefix)
+);
 
 CREATE TABLE IF NOT EXISTS tool_calls (
     id                    BIGSERIAL PRIMARY KEY,
@@ -814,6 +828,16 @@ func EnsureSchema(
 			"source_project_identity_observations", "remote_candidate_count",
 			`remote_candidate_count INT NOT NULL DEFAULT 0`,
 			"adding source_project_identity_observations.remote_candidate_count",
+		},
+		{
+			"sessions", "source_archive_id",
+			`source_archive_id TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.source_archive_id",
+		},
+		{
+			"sessions", "file_path",
+			`file_path TEXT`,
+			"adding sessions.file_path",
 		},
 	}
 	step = time.Now()
@@ -2055,9 +2079,9 @@ func CheckSchemaCompat(
 }
 
 // checkPushSchemaCompat verifies schema elements that only push needs. PG serve
-// never reads sync_metadata or owner_marker, so they live outside
-// CheckSchemaCompat (which gates read-only serve startup) and are checked only
-// on the push fast path.
+// never reads sync_metadata, owner_marker, source_archive_id, or file_path, so
+// they live outside CheckSchemaCompat (which gates read-only serve startup)
+// and are checked only on the push fast path.
 func checkPushSchemaCompat(ctx context.Context, db *sql.DB) error {
 	rows, err := db.QueryContext(ctx,
 		`SELECT key, value FROM sync_metadata LIMIT 0`)
@@ -2068,7 +2092,7 @@ func checkPushSchemaCompat(ctx context.Context, db *sql.DB) error {
 	rows.Close()
 
 	rows, err = db.QueryContext(ctx,
-		`SELECT owner_marker FROM sessions LIMIT 0`)
+		`SELECT owner_marker, source_archive_id, file_path FROM sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"sessions table missing push ownership columns: %w", err)
@@ -2079,7 +2103,8 @@ func checkPushSchemaCompat(ctx context.Context, db *sql.DB) error {
 
 // pushSchemaCurrent reports whether the PG schema has everything a push
 // needs. CheckSchemaCompat covers the read and PG serve write paths but does
-// not require push-only sync_metadata or sessions.owner_marker (verified by
+// not require push-only sync_metadata or sessions.owner_marker,
+// sessions.source_archive_id, and sessions.file_path (verified by
 // checkPushSchemaCompat), model_pricing (always queried by syncModelPricing)
 // or cursor_usage_events (written by syncCursorUsageEvents), so probe those
 // explicitly. It also requires the cursor dedup index, which the cursor usage

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { m } from "../../i18n/index.js";
-  import { onMount, untrack } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import {
     activity,
     localDateStr,
@@ -34,6 +34,43 @@
   import SessionsTable from "./SessionsTable.svelte";
   import Breakdowns from "./Breakdowns.svelte";
   import ActivityInsight from "./ActivityInsight.svelte";
+  import ProjectReclassificationModal from "./ProjectReclassificationModal.svelte";
+  import type { ActivityQueryParams } from "../../stores/activity.svelte.js";
+
+  type ReclassificationState = {
+    projectLabel: string;
+    projectKey: string;
+    trigger: HTMLButtonElement;
+    queryParams: ActivityQueryParams;
+  };
+
+  let reclassification = $state<ReclassificationState | null>(null);
+  let projectHeadingRef = $state<HTMLElement>();
+  const reclassificationUnavailable = $derived(
+    sync.serverVersion === null || sync.readOnly,
+  );
+
+  function openReclassification(
+    projectLabel: string,
+    projectKey: string,
+    trigger: HTMLButtonElement,
+  ) {
+    if (reclassificationUnavailable) return;
+    reclassification = {
+      projectLabel,
+      projectKey,
+      trigger,
+      queryParams: activity.queryParams(),
+    };
+  }
+
+  async function finishReclassification() {
+    const trigger = reclassification?.trigger;
+    reclassification = null;
+    await tick();
+    if (trigger?.isConnected) trigger.focus();
+    else projectHeadingRef?.focus();
+  }
 
   // Date-only (local) bounds for the inline insight panel, derived from the
   // loaded report's resolved range, the authoritative source for the current
@@ -400,7 +437,13 @@
         />
       </Card>
       <Card level="default" padding="none" class="chart-panel">
-        <Breakdowns report={activity.report} />
+        <Breakdowns
+          report={activity.report}
+          readOnly={reclassificationUnavailable}
+          readOnlyExplained={sync.readOnly}
+          onReclassifyProject={openReclassification}
+          bind:projectHeadingRef
+        />
       </Card>
     {:else if activity.loading}
       <div class="status">{m.activity_loading_report()}</div>
@@ -431,6 +474,18 @@
       </Card>
     {/if}
   </div>
+
+  {#if reclassification}
+    <ProjectReclassificationModal
+      projectLabel={reclassification.projectLabel}
+      projectKey={reclassification.projectKey}
+      projects={activity.projects}
+      queryParams={reclassification.queryParams}
+      onclose={() => (reclassification = null)}
+      onRefresh={() => activity.refreshAfterReclassification()}
+      onComplete={finishReclassification}
+    />
+  {/if}
 </div>
 
 <style>

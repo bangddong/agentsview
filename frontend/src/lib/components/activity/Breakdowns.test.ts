@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mount, tick, unmount } from "svelte";
 import Breakdowns from "./Breakdowns.svelte";
 import type { Report } from "../../api/types.js";
@@ -8,12 +8,21 @@ function makeReport(): Report {
   return {
     peak: { agents: 0, at: null },
     totals: {
-      active_minutes: 0, idle_minutes: 0, agent_minutes: 0, sessions: 0,
-      untimed_sessions: 0, distinct_projects: 0, distinct_models: 0,
-      output_tokens: 0, cost: 0,
-      automated_agent_minutes: 0, interactive_agent_minutes: 0,
-      automated_cost: 0, interactive_cost: 0,
-      automated_sessions: 0, interactive_sessions: 0,
+      active_minutes: 0,
+      idle_minutes: 0,
+      agent_minutes: 0,
+      sessions: 0,
+      untimed_sessions: 0,
+      distinct_projects: 0,
+      distinct_models: 0,
+      output_tokens: 0,
+      cost: 0,
+      automated_agent_minutes: 0,
+      interactive_agent_minutes: 0,
+      automated_cost: 0,
+      interactive_cost: 0,
+      automated_sessions: 0,
+      interactive_sessions: 0,
     },
     partial: false,
     as_of: null,
@@ -28,14 +37,24 @@ function makeReport(): Report {
     buckets: [],
     by_project: [
       {
-        key: "alpha", project_key: "pl1:sha256:alpha", agent_minutes: 30, cost: 0,
-        interactive_agent_minutes: 20, automated_agent_minutes: 10,
-        interactive_cost: 0, automated_cost: 0,
+        key: "alpha",
+        project_key: "pl1:sha256:alpha",
+        agent_minutes: 30,
+        cost: 0,
+        interactive_agent_minutes: 20,
+        automated_agent_minutes: 10,
+        interactive_cost: 0,
+        automated_cost: 0,
       },
       {
-        key: "beta", project_key: "pl1:sha256:beta", agent_minutes: 10, cost: 0,
-        interactive_agent_minutes: 10, automated_agent_minutes: 0,
-        interactive_cost: 0, automated_cost: 0,
+        key: "beta",
+        project_key: "pl1:sha256:beta",
+        agent_minutes: 10,
+        cost: 0,
+        interactive_agent_minutes: 10,
+        automated_agent_minutes: 0,
+        interactive_cost: 0,
+        automated_cost: 0,
       },
     ],
     by_model: [],
@@ -101,14 +120,22 @@ describe("Breakdowns", () => {
     // usage; they must not render as empty "0" bars in the minutes view.
     report.by_project = [
       {
-        key: "timed", agent_minutes: 30, cost: 1,
-        interactive_agent_minutes: 30, automated_agent_minutes: 0,
-        interactive_cost: 1, automated_cost: 0,
+        key: "timed",
+        agent_minutes: 30,
+        cost: 1,
+        interactive_agent_minutes: 30,
+        automated_agent_minutes: 0,
+        interactive_cost: 1,
+        automated_cost: 0,
       },
       {
-        key: "costonly", agent_minutes: 0, cost: 5,
-        interactive_agent_minutes: 0, automated_agent_minutes: 0,
-        interactive_cost: 5, automated_cost: 0,
+        key: "costonly",
+        agent_minutes: 0,
+        cost: 5,
+        interactive_agent_minutes: 0,
+        automated_agent_minutes: 0,
+        interactive_cost: 5,
+        automated_cost: 0,
       },
     ] as Report["by_project"];
     const target = document.createElement("div");
@@ -128,14 +155,22 @@ describe("Breakdowns", () => {
     const report = makeReport();
     report.by_project = [
       {
-        key: "timed", agent_minutes: 30, cost: 1,
-        interactive_agent_minutes: 30, automated_agent_minutes: 0,
-        interactive_cost: 1, automated_cost: 0,
+        key: "timed",
+        agent_minutes: 30,
+        cost: 1,
+        interactive_agent_minutes: 30,
+        automated_agent_minutes: 0,
+        interactive_cost: 1,
+        automated_cost: 0,
       },
       {
-        key: "costonly", agent_minutes: 0, cost: 5,
-        interactive_agent_minutes: 0, automated_agent_minutes: 0,
-        interactive_cost: 5, automated_cost: 0,
+        key: "costonly",
+        agent_minutes: 0,
+        cost: 5,
+        interactive_agent_minutes: 0,
+        automated_agent_minutes: 0,
+        interactive_cost: 5,
+        automated_cost: 0,
       },
     ] as Report["by_project"];
     const target = document.createElement("div");
@@ -163,18 +198,85 @@ describe("Breakdowns", () => {
   });
 
   it("renders distinct project identities that share a display label", async () => {
-	const report = makeReport();
-	report.by_project = [
-		{ ...report.by_project![0], key: "same", project_key: "pl1:sha256:a" },
-		{ ...report.by_project![1], key: "same", project_key: "pl1:sha256:b" },
-	] as Report["by_project"];
-	const target = document.createElement("div");
-	document.body.appendChild(target);
-	const component = mount(Breakdowns, { target, props: { report } });
-	await tick();
+    const report = makeReport();
+    report.by_project = [
+      { ...report.by_project![0], key: "same", project_key: "pl1:sha256:a" },
+      { ...report.by_project![1], key: "same", project_key: "pl1:sha256:b" },
+    ] as Report["by_project"];
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const component = mount(Breakdowns, { target, props: { report } });
+    await tick();
 
-	expect(target.querySelectorAll(".bar-row")).toHaveLength(2);
-	unmount(component);
-	target.remove();
+    expect(target.querySelectorAll(".bar-row")).toHaveLength(2);
+    unmount(component);
+    target.remove();
+  });
+
+  it("renders actions only for project rows and passes the clicked identity", async () => {
+    const report = makeReport();
+    report.by_model = [{ ...report.by_project![0], key: "model-a" }];
+    report.by_agent = [{ ...report.by_project![0], key: "agent-a" }];
+    const onReclassifyProject = vi.fn();
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const component = mount(Breakdowns, {
+      target,
+      props: { report, readOnly: false, onReclassifyProject },
+    });
+    await tick();
+
+    const actions = target.querySelectorAll('button[aria-label^="Reclassify project"]');
+    expect(actions).toHaveLength(2);
+    (actions[0] as HTMLButtonElement).click();
+    expect(onReclassifyProject).toHaveBeenCalledWith("alpha", "pl1:sha256:alpha", actions[0]);
+    expect(target.querySelectorAll(".project-action")).toHaveLength(2);
+    unmount(component);
+  });
+
+  it("keeps unavailable actions tabbable and suppresses activation", async () => {
+    const onReclassifyProject = vi.fn();
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const component = mount(Breakdowns, {
+      target,
+      props: {
+        report: makeReport(),
+        readOnly: true,
+        readOnlyExplained: true,
+        onReclassifyProject,
+      },
+    });
+    await tick();
+
+    const action = target.querySelector(
+      'button[aria-label^="Reclassify project"]',
+    ) as HTMLButtonElement;
+    expect(action.disabled).toBe(false);
+    expect(action.getAttribute("aria-disabled")).toBe("true");
+    expect(action.title).toContain("writable archive");
+    action.focus();
+    expect(document.activeElement).toBe(action);
+    action.click();
+    expect(onReclassifyProject).not.toHaveBeenCalled();
+    unmount(component);
+  });
+
+  it("does not claim read-only before the server mode is known", async () => {
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const component = mount(Breakdowns, {
+      target,
+      props: { report: makeReport(), readOnly: true },
+    });
+    await tick();
+
+    const action = target.querySelector(
+      'button[aria-label^="Reclassify project"]',
+    ) as HTMLButtonElement;
+    expect(action.getAttribute("aria-disabled")).toBe("true");
+    expect(action.title).not.toContain("writable archive");
+    expect(action.title).toContain("Reclassify project");
+    unmount(component);
   });
 });

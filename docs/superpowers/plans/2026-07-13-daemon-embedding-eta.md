@@ -1,5 +1,9 @@
 # Daemon-Owned Embedding ETA Implementation Plan
 
+> **Status:** Complete. Shipped via PR #1095 (feat(settings): show embeddings
+> build status and ETA) and PR #1137 (feat(embeddings): keep ETA in daemon
+> memory); verified against origin/main 2026-07-17.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
@@ -46,7 +50,7 @@ ______________________________________________________________________
 - Consumes: `Manager.now()` as a monotonic observation clock and the existing
   `BuildProgress` callback stream
 
-- [ ] **Step 1: Write failing estimator tests**
+- [x] **Step 1: Write failing estimator tests**
 
     Add table-driven/testify coverage for baseline plus two positive samples,
     stalled-time inclusion, phase and denominator resets, counter regression,
@@ -61,7 +65,7 @@ ______________________________________________________________________
     assert.Equal(t, 16*time.Second, got.Remaining)
     ```
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
     Run:
     `CGO_ENABLED=1 go test -tags fts5 ./internal/vector -run 'TestBuildETA|TestManagerStatusPublishesETA'`
@@ -69,7 +73,7 @@ ______________________________________________________________________
     Expected: compilation fails because the estimator and status fields do not
     exist.
 
-- [ ] **Step 3: Implement the estimator**
+- [x] **Step 3: Implement the estimator**
 
     Define focused private types in `eta.go`:
 
@@ -95,19 +99,19 @@ ______________________________________________________________________
     `0.3*instantaneous + 0.7*previous`, keep zero-delta observations out of the
     baseline, require two samples, and reject non-positive/non-finite output.
 
-- [ ] **Step 4: Wire estimates into manager status**
+- [x] **Step 4: Wire estimates into manager status**
 
     Add the three JSON fields with `omitempty` to `BuildStatus`. Reset the private
     estimator in `begin` and `finish`; in `reportProgress`, sample with
     `m.now()` and copy either a ready estimate or zero values into status.
 
-- [ ] **Step 5: Add manager-level regression coverage**
+- [x] **Step 5: Add manager-level regression coverage**
 
     Use a controllable `m.now` and direct progress reports after `m.begin()` to
     prove a ready estimate appears in `Status()` and that `m.finish(...)` clears
     it. Assert model/dimension and existing lifecycle fields remain intact.
 
-- [ ] **Step 6: Run focused and package tests**
+- [x] **Step 6: Run focused and package tests**
 
     Run: `CGO_ENABLED=1 go test -tags fts5 ./internal/vector`
 
@@ -130,7 +134,7 @@ ______________________________________________________________________
 
 - Produces: immediate Settings rendering from the first warmed daemon response
 
-- [ ] **Step 1: Rewrite component coverage to expect server estimates**
+- [x] **Step 1: Rewrite component coverage to expect server estimates**
 
     Make the initial mocked running status ready:
 
@@ -146,7 +150,7 @@ ______________________________________________________________________
     Separately assert a response with `estimate_ready: false` renders the
     existing estimating message. Remove tests for client-side build-key resets.
 
-- [ ] **Step 2: Run the focused component test and confirm RED**
+- [x] **Step 2: Run the focused component test and confirm RED**
 
     Run:
     `npm test -- --run src/lib/components/settings/EmbeddingsSettings.test.ts`
@@ -155,13 +159,13 @@ ______________________________________________________________________
     Expected: type/render failures because the generated status and component do
     not consume the server fields yet.
 
-- [ ] **Step 3: Regenerate the API client**
+- [x] **Step 3: Regenerate the API client**
 
     Run: `npm run generate:api` from `frontend/`. Keep only changes caused by the
     additive `BuildStatus` fields; inspect and exclude unrelated generator
     drift.
 
-- [ ] **Step 4: Remove the browser estimator**
+- [x] **Step 4: Remove the browser estimator**
 
     Delete the estimator import, instance, state, sampling function, and reset
     calls. Derive display values directly:
@@ -175,7 +179,7 @@ ______________________________________________________________________
     Retain `elapsedMs` updates from `started_at` and existing polling behavior.
     Delete the now-unused estimator source and unit test.
 
-- [ ] **Step 5: Run frontend verification**
+- [x] **Step 5: Run frontend verification**
 
     Run from `frontend/`:
 
@@ -198,13 +202,13 @@ ______________________________________________________________________
 
 - Produces: a verified feature-branch commit ready to push when authorized
 
-- [ ] **Step 1: Format and inspect generated drift**
+- [x] **Step 1: Format and inspect generated drift**
 
     Run `go fmt ./...`, then inspect `git status --short`, `git diff --stat`, and
     `git diff --check`. Confirm there are no database, migration, config, or
     unrelated generated changes.
 
-- [ ] **Step 2: Run backend verification**
+- [x] **Step 2: Run backend verification**
 
     Run:
 
@@ -215,7 +219,7 @@ ______________________________________________________________________
 
     Expected: PASS.
 
-- [ ] **Step 3: Run frontend verification**
+- [x] **Step 3: Run frontend verification**
 
     Run from `frontend/`:
 
@@ -226,7 +230,7 @@ ______________________________________________________________________
 
     Expected: PASS.
 
-- [ ] **Step 4: Commit the implementation**
+- [x] **Step 4: Commit the implementation**
 
     Stage only the scoped files and commit with a conventional subject describing
     daemon-owned embedding ETA. Do not bypass hooks, amend the design commit,

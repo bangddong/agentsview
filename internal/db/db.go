@@ -308,8 +308,11 @@ const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1
 // and entrypoint fields on existing Claude rows.)
 // (67: Antigravity CLI reader metadata. Re-parsing populates parent_session_id
 // and relationship_type from agyReader.parentCascadeId in trajectory sidecars.)
-// (68: Hermes skill_view metadata. Re-parsing populates tool_calls.skill_name
-// for existing Hermes sessions so historical skill usage appears in analytics.)
+// (68: Hermes skill_view metadata, generic GitHub worktree layouts, and
+// parser-source project identity snapshots. Re-parsing populates historical
+// Hermes skill usage, corrects affected worktree project names, and replaces
+// snapshots that older mapping behavior could persist with the mapped target
+// label before incremental ingestion is allowed to reuse them.)
 const dataVersion = 68
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
@@ -1071,6 +1074,11 @@ CREATE TABLE IF NOT EXISTS session_project_identity_snapshots (
     key                TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_session_project_identity_snapshots_evidence
+    ON session_project_identity_snapshots(
+        machine, root_path, git_remote, observed_at DESC, session_id
+    );
 
 CREATE TABLE IF NOT EXISTS background_migrations (
     name            TEXT PRIMARY KEY,
@@ -1944,6 +1952,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"ALTER TABLE worktree_project_mappings ADD COLUMN layout TEXT NOT NULL DEFAULT 'explicit'",
 		},
 		{
+			"worktree_project_mappings", "original_project",
+			"ALTER TABLE worktree_project_mappings ADD COLUMN original_project TEXT NOT NULL DEFAULT ''",
+		},
+		{
 			"project_identity_observations", "session_id",
 			"ALTER TABLE project_identity_observations ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
 		},
@@ -2146,6 +2158,7 @@ func (db *DB) migrateColumns() error {
 			path_prefix TEXT NOT NULL,
 			layout      TEXT NOT NULL DEFAULT 'explicit',
 			project     TEXT NOT NULL,
+			original_project TEXT NOT NULL DEFAULT '',
 			enabled     INTEGER NOT NULL DEFAULT 1,
 			created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 			updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -2213,6 +2226,10 @@ func (db *DB) migrateColumns() error {
 			key                TEXT NOT NULL DEFAULT '',
 			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
+		CREATE INDEX IF NOT EXISTS idx_session_project_identity_snapshots_evidence
+			ON session_project_identity_snapshots(
+				machine, root_path, git_remote, observed_at DESC, session_id
+			);
 	`); err != nil {
 		return fmt.Errorf(
 			"creating project identity metadata: %w", err,

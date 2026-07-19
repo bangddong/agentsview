@@ -616,7 +616,9 @@ type SidebarSessionIndexRow struct {
 type SidebarSessionIndex struct {
 	Sessions   []SidebarSessionIndexRow `json:"sessions"`
 	NextCursor string                   `json:"next_cursor,omitempty"`
-	Total      int                      `json:"total"`
+	// Total counts canonical root groups matching the filter. Sessions may
+	// contain additional descendant rows needed to render those groups.
+	Total int `json:"total"`
 }
 
 // buildSessionFilter returns a WHERE clause and args for the
@@ -719,6 +721,20 @@ func (db *DB) GetSidebarSessionIndex(
 	}
 
 	f.Cursor = ""
+	rootFilter := f
+	rootFilter.IncludeChildren = false
+	rootWhere, rootArgs := buildSessionBaseFilter(rootFilter)
+	canonicalRootWhere := buildCanonicalRootWhere(f.IncludeOrphans)
+	var total int
+	countQuery := "SELECT COUNT(*) FROM sessions WHERE " +
+		rootWhere + " AND " + canonicalRootWhere
+	if err := db.getReader().QueryRowContext(
+		ctx, countQuery, rootArgs...,
+	).Scan(&total); err != nil {
+		return SidebarSessionIndex{},
+			fmt.Errorf("counting sidebar roots: %w", err)
+	}
+
 	where, args := buildSessionFilter(f)
 	query := `
 		SELECT
@@ -757,6 +773,7 @@ func (db *DB) GetSidebarSessionIndex(
 
 	index := SidebarSessionIndex{
 		Sessions: []SidebarSessionIndexRow{},
+		Total:    total,
 	}
 	for rows.Next() {
 		var row SidebarSessionIndexRow
@@ -789,8 +806,6 @@ func (db *DB) GetSidebarSessionIndex(
 		return SidebarSessionIndex{},
 			fmt.Errorf("iterating sidebar session index: %w", err)
 	}
-	index.Total = len(index.Sessions)
-
 	return index, nil
 }
 
@@ -1378,26 +1393,46 @@ func upsertSessionArgs(s Session) []any {
 // Sessions that were permanently deleted (in excluded_sessions)
 // or currently in the trash are rejected.
 func (db *DB) UpsertSession(s Session) error {
-	_ = ValidateAndSanitize(&s, nil, nil)
-
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	writer := db.getWriter()
+	_, err := upsertSessionExec(
+		writer.Exec,
+		writer.QueryRow,
+		s,
+	)
+	return err
+}
+
+func upsertSessionExec(
+	exec func(string, ...any) (sql.Result, error),
+	queryRow func(string, ...any) rowScanner,
+	s Session,
+) (bool, error) {
+	_ = ValidateAndSanitize(&s, nil, nil)
 
 	// Check exclusion/trash state under the write lock to avoid a race with
 	// concurrent DeleteSession/EmptyTrash/RestoreSession.
 	var excluded int
-	_ = db.getWriter().QueryRow(
+	err := queryRow(
 		"SELECT 1 FROM excluded_sessions WHERE id = ?", s.ID,
 	).Scan(&excluded)
-	if excluded == 1 {
-		return ErrSessionExcluded
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("checking exclusion for %s: %w", s.ID, err)
 	}
-	var trashed int
-	_ = db.getWriter().QueryRow(
-		"SELECT 1 FROM sessions WHERE id = ? AND deleted_at IS NOT NULL", s.ID,
-	).Scan(&trashed)
-	if trashed == 1 {
-		return ErrSessionTrashed
+	if excluded == 1 {
+		return false, ErrSessionExcluded
+	}
+	var deletedAt sql.NullString
+	err = queryRow(
+		"SELECT deleted_at FROM sessions WHERE id = ?", s.ID,
+	).Scan(&deletedAt)
+	sessionInserted := errors.Is(err, sql.ErrNoRows)
+	if err != nil && !sessionInserted {
+		return false, fmt.Errorf("checking session %s: %w", s.ID, err)
+	}
+	if deletedAt.Valid {
+		return false, ErrSessionTrashed
 	}
 
 	// data_version is intentionally NOT advanced here. The
@@ -1407,14 +1442,14 @@ func (db *DB) UpsertSession(s Session) error {
 	// up-to-date and starve the rewrite on the next sync.
 	// New rows are seeded with 0 (the default) and bumped to
 	// the current version once their messages land.
-	_, err := db.getWriter().Exec(
+	_, err = exec(
 		upsertSessionSQL,
 		upsertSessionArgs(s)...,
 	)
 	if err != nil {
-		return fmt.Errorf("upserting session %s: %w", s.ID, err)
+		return false, fmt.Errorf("upserting session %s: %w", s.ID, err)
 	}
-	return nil
+	return sessionInserted, nil
 }
 
 // insertSessionIfAbsent inserts a session only when no row with its id exists,
@@ -1791,6 +1826,7 @@ func (db *DB) GetSessionVersion(
 type IncrementalInfo struct {
 	ID                   string
 	Project              string
+	SourceProject        string
 	Machine              string
 	Cwd                  string
 	AgentLabel           string
@@ -1860,7 +1896,8 @@ func (db *DB) GetSessionForIncremental(
 	var fs, fm, fi, fd sql.NullInt64
 	var firstMsg, lastEntryUUID sql.NullString
 	err = db.getReader().QueryRow(
-		`SELECT id, project, machine, cwd, agent_label, entrypoint,
+		`SELECT s.id, s.project, COALESCE(snap.project, ''),
+			s.machine, s.cwd, s.agent_label, s.entrypoint,
 			file_size, file_mtime,
 			next_ordinal, last_entry_uuid,
 			file_inode, file_device,
@@ -1868,12 +1905,15 @@ func (db *DB) GetSessionForIncremental(
 			first_message,
 			total_output_tokens, peak_context_tokens,
 			has_total_output_tokens, has_peak_context_tokens
-		 FROM sessions
-		 WHERE file_path = ?
-		   AND deleted_at IS NULL`,
+		 FROM sessions s
+		 LEFT JOIN session_project_identity_snapshots snap
+		   ON snap.session_id = s.id
+		 WHERE s.file_path = ?
+		   AND s.deleted_at IS NULL`,
 		path,
 	).Scan(
-		&info.ID, &info.Project, &info.Machine, &info.Cwd,
+		&info.ID, &info.Project, &info.SourceProject,
+		&info.Machine, &info.Cwd,
 		&info.AgentLabel, &info.Entrypoint,
 		&fs, &fm, &info.NextOrdinal, &lastEntryUUID, &fi, &fd,
 		&info.MsgCount, &info.UserMsgCount,

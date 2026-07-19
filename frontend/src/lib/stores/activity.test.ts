@@ -9,9 +9,7 @@ const api = vi.hoisted(() => ({
 }));
 
 const apiRuntimeMocks = vi.hoisted(() => ({
-  callGenerated: vi.fn(
-    (request: () => Promise<unknown>, _signal?: AbortSignal) => request(),
-  ),
+  callGenerated: vi.fn((request: () => Promise<unknown>, _signal?: AbortSignal) => request()),
 }));
 
 vi.mock("../api/generated/index", () => ({
@@ -109,9 +107,8 @@ beforeEach(() => {
   activity.invalidateFilterOptions();
   // Restore a fresh router.replaceParams spy. The writeUrl test reassigns it,
   // so reset here to keep that reassignment from leaking into later tests.
-  (
-    routerMod.router as unknown as { replaceParams: ReturnType<typeof vi.fn> }
-  ).replaceParams = vi.fn();
+  (routerMod.router as unknown as { replaceParams: ReturnType<typeof vi.fn> }).replaceParams =
+    vi.fn();
 });
 afterEach(() => {
   // Release any ActivityPage attachment so the singleton's attach count does
@@ -121,15 +118,73 @@ afterEach(() => {
 });
 
 describe("load", () => {
+  it("uses one query object for reports and reclassification candidates", async () => {
+    activity.setCustomRange("2026-06-10", "2026-06-16");
+    activity.setProject("source-project");
+    activity.setAgent("codex");
+    activity.setMachine("remote.example");
+    activity.setAutomation("automated");
+    activity.bucket = "1h";
+
+    const params = activity.queryParams();
+    api.getActivityReport.mockResolvedValue(makeReport());
+    await activity.load();
+
+    expect(api.getActivityReport).toHaveBeenCalledWith(params);
+    expect(params).toEqual({
+      preset: "custom",
+      date: "2026-06-10",
+      from: new Date("2026-06-10T00:00:00").toISOString(),
+      to: new Date("2026-06-17T00:00:00").toISOString(),
+      timezone: activity.timezone,
+      bucket: "1h",
+      project: "source-project",
+      agent: "codex",
+      machine: "remote.example",
+      automation: "automated",
+    });
+  });
+
+  it("preserves the report and reloads filter options after reclassification", async () => {
+    const prior = makeReport({ range_start: "2026-06-15T00:00:00Z" });
+    activity.report = prior;
+    api.getActivityReport.mockResolvedValue(makeReport({ range_start: "2026-06-16T00:00:00Z" }));
+    api.getProjects.mockResolvedValue({ projects: [] });
+    api.getAgents.mockResolvedValue({ agents: [] });
+    api.getMachines.mockResolvedValue({ machines: [] });
+
+    await expect(activity.refreshAfterReclassification()).resolves.toBe(true);
+    expect(activity.report?.range_start).toBe("2026-06-16T00:00:00Z");
+    expect(api.getProjects).toHaveBeenCalledTimes(1);
+    expect(api.getAgents).toHaveBeenCalledTimes(1);
+    expect(api.getMachines).toHaveBeenCalledTimes(1);
+
+    api.getActivityReport.mockRejectedValueOnce(new Error("refresh failed"));
+    await expect(activity.refreshAfterReclassification()).resolves.toBe(false);
+    expect(activity.report?.range_start).toBe("2026-06-16T00:00:00Z");
+  });
+
+  it("reports a stale refresh when filter options fail after the report succeeds", async () => {
+    const prior = makeReport({ range_start: "2026-06-15T00:00:00Z" });
+    activity.report = prior;
+    api.getActivityReport.mockResolvedValue(makeReport({ range_start: "2026-06-16T00:00:00Z" }));
+    api.getProjects.mockRejectedValueOnce(new Error("projects unavailable"));
+    api.getAgents.mockResolvedValue({ agents: [] });
+    api.getMachines.mockResolvedValue({ machines: [] });
+
+    await expect(activity.refreshAfterReclassification()).resolves.toBe(false);
+    expect(activity.report?.range_start).toBe("2026-06-16T00:00:00Z");
+    expect(activity.projects).toEqual([]);
+  });
+
   it("aborts the obsolete report when a replacement starts", async () => {
     const signals: AbortSignal[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation((
-      request: () => Promise<unknown>,
-      signal?: AbortSignal,
-    ) => {
-      signals.push(signal as AbortSignal);
-      return request();
-    });
+    apiRuntimeMocks.callGenerated.mockImplementation(
+      (request: () => Promise<unknown>, signal?: AbortSignal) => {
+        signals.push(signal as AbortSignal);
+        return request();
+      },
+    );
     api.getActivityReport
       .mockImplementationOnce(() => new Promise(() => {}))
       .mockResolvedValueOnce(makeReport());
@@ -143,13 +198,12 @@ describe("load", () => {
 
   it("aborts the visible report on teardown", async () => {
     const signals: AbortSignal[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation((
-      request: () => Promise<unknown>,
-      signal?: AbortSignal,
-    ) => {
-      signals.push(signal as AbortSignal);
-      return request();
-    });
+    apiRuntimeMocks.callGenerated.mockImplementation(
+      (request: () => Promise<unknown>, signal?: AbortSignal) => {
+        signals.push(signal as AbortSignal);
+        return request();
+      },
+    );
     api.getActivityReport.mockImplementationOnce(() => new Promise(() => {}));
 
     void activity.load();
@@ -193,9 +247,7 @@ describe("load", () => {
     api.getActivityReport.mockResolvedValue(makeReport());
     activity.setAutomation("automated");
     await activity.load();
-    expect(api.getActivityReport.mock.calls.at(-1)![0].automation).toBe(
-      "automated",
-    );
+    expect(api.getActivityReport.mock.calls.at(-1)![0].automation).toBe("automated");
   });
 
   it("ignores a stale response when params change mid-flight", async () => {
@@ -258,8 +310,7 @@ describe("load", () => {
     try {
       vi.setSystemTime(new Date("2026-06-19T12:00:00"));
       activity.setCustomRange("2026-05-21", "2026-06-19", 30);
-      const replaceParams =
-        routerMod.router.replaceParams as ReturnType<typeof vi.fn>;
+      const replaceParams = routerMod.router.replaceParams as ReturnType<typeof vi.fn>;
       replaceParams.mockClear();
       api.getActivityReport.mockResolvedValue(makeReport());
 
@@ -267,12 +318,8 @@ describe("load", () => {
       await activity.load({ background: true });
 
       const arg = api.getActivityReport.mock.calls.at(-1)![0];
-      expect(arg.from).toBe(
-        new Date("2026-05-22T00:00:00").toISOString(),
-      );
-      expect(arg.to).toBe(
-        new Date("2026-06-21T00:00:00").toISOString(),
-      );
+      expect(arg.from).toBe(new Date("2026-05-22T00:00:00").toISOString());
+      expect(arg.to).toBe(new Date("2026-06-21T00:00:00").toISOString());
       expect(activity.from).toBe("2026-05-22");
       expect(activity.to).toBe("2026-06-20");
       expect(replaceParams.mock.calls.at(-1)?.[0]).toMatchObject({
@@ -459,9 +506,7 @@ describe("freshness state", () => {
 
       expect(activity.lastUpdatedAt).toBeNull();
       await activity.load();
-      expect(activity.lastUpdatedAt).toBe(
-        new Date("2026-06-16T12:00:00Z").getTime(),
-      );
+      expect(activity.lastUpdatedAt).toBe(new Date("2026-06-16T12:00:00Z").getTime());
       expect(activity.hasNewData).toBe(false);
 
       activity.markNewData();
@@ -469,9 +514,7 @@ describe("freshness state", () => {
 
       vi.setSystemTime(new Date("2026-06-16T12:05:00Z"));
       await activity.load();
-      expect(activity.lastUpdatedAt).toBe(
-        new Date("2026-06-16T12:05:00Z").getTime(),
-      );
+      expect(activity.lastUpdatedAt).toBe(new Date("2026-06-16T12:05:00Z").getTime());
       expect(activity.hasNewData).toBe(false);
     } finally {
       vi.useRealTimers();
@@ -502,7 +545,10 @@ describe("freshness state", () => {
 describe("url state", () => {
   it("hydrates preset/date/filters from params", () => {
     activity.hydrateFromUrl({
-      preset: "week", date: "2026-06-16", project: "p1", agent: "claude",
+      preset: "week",
+      date: "2026-06-16",
+      project: "p1",
+      agent: "claude",
     });
     expect(activity.preset).toBe("week");
     expect(activity.date).toBe("2026-06-16");
@@ -544,8 +590,7 @@ describe("url state", () => {
     activity.setDate("2026-06-01");
     activity.setProject("");
     // Replace router.replaceParams with a spy for this test.
-    (routerMod.router as unknown as { replaceParams: typeof spy }).replaceParams =
-      spy;
+    (routerMod.router as unknown as { replaceParams: typeof spy }).replaceParams = spy;
     activity.writeUrl();
     expect(spy).toHaveBeenCalledTimes(1);
     const written = spy.mock.calls[0]![0] as Record<string, string>;

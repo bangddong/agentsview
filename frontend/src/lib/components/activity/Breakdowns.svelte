@@ -1,9 +1,29 @@
 <script lang="ts">
   import { m } from "../../i18n/index.js";
+  import { IconButton } from "@kenn-io/kit-ui";
+  import PencilLineIcon from "@lucide/svelte/icons/pencil-line";
   import type { Report } from "../../api/types.js";
   import type { ActivityKeyMinutes } from "../../api/generated/index";
 
-  let { report }: { report: Report } = $props();
+  interface Props {
+    report: Report;
+    readOnly?: boolean;
+    readOnlyExplained?: boolean;
+    onReclassifyProject?: (
+      label: string,
+      projectKey: string,
+      trigger: HTMLButtonElement,
+    ) => void;
+    projectHeadingRef?: HTMLElement;
+  }
+
+  let {
+    report,
+    readOnly = false,
+    readOnlyExplained = false,
+    onReclassifyProject = undefined,
+    projectHeadingRef = $bindable(),
+  }: Props = $props();
 
   type Metric = "minutes" | "cost";
   let metric = $state<Metric>("minutes");
@@ -158,13 +178,20 @@
       {@const max = maxValue(panel.rows)}
       {@const total = sumValue(panel.rows)}
       <div class="breakdown-panel">
-        <h4 class="panel-title">{panel.title}</h4>
+        {#if panel.projectRows}
+          <h4 class="panel-title" tabindex="-1" bind:this={projectHeadingRef}>
+            {panel.title}
+          </h4>
+        {:else}
+          <h4 class="panel-title">{panel.title}</h4>
+        {/if}
         {#if panel.rows.length > 0}
           <div class="bar-list">
             {#each panel.rows as row (rowIdentity(row, panel.projectRows))}
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <div
                 class="bar-row"
+                class:has-action={panel.projectRows}
                 onmouseenter={(e) => showTip(e, row, total)}
                 onmouseleave={hideTip}
               >
@@ -184,6 +211,26 @@
                 <span class="bar-value">
                   {fmtValue(row)}
                 </span>
+                {#if panel.projectRows}
+                  <span class="project-action">
+                    <IconButton
+                      size="sm"
+                      ariaLabel={m.activity_reclassify_action({ project: row.key })}
+                      title={readOnly && readOnlyExplained
+                        ? m.activity_reclassify_unavailable_read_only()
+                        : m.activity_reclassify_action({ project: row.key })}
+                      ariaDisabled={readOnly}
+                      onclick={(event) =>
+                        onReclassifyProject?.(
+                          row.key,
+                          row.project_key || row.key,
+                          event.currentTarget as HTMLButtonElement,
+                        )}
+                    >
+                      <PencilLineIcon size="13" aria-hidden="true" />
+                    </IconButton>
+                  </span>
+                {/if}
               </div>
             {/each}
           </div>
@@ -314,6 +361,13 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    position: relative;
+  }
+
+  /* Reserve a slot for the reveal-on-hover action so it never covers the
+     value column. */
+  .bar-row.has-action {
+    padding-right: 26px;
   }
 
   .bar-label {
@@ -354,6 +408,27 @@
     font-size: 10px;
     font-family: var(--font-mono);
     color: var(--text-muted);
+  }
+
+  .project-action {
+    position: absolute;
+    right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    opacity: 0;
+    transition: opacity var(--transition-fast) var(--transition-ease, ease);
+  }
+
+  .bar-row:hover .project-action,
+  .bar-row:focus-within .project-action,
+  .project-action:focus-within {
+    opacity: 1;
+  }
+
+  @media (pointer: coarse) {
+    .project-action {
+      opacity: 1;
+    }
   }
 
   .empty {

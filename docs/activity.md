@@ -99,6 +99,40 @@ stacked bars to compare interactive and automated contributions.
 Rows with no value for the selected metric are omitted from that view, so
 cost-only untimed sessions appear in **Cost** but not **Agent-min**.
 
+## Reclassify A Project
+
+Worktree layouts the parser does not recognize can surface a branch or
+worktree directory name as a project. When that happens, hover or
+keyboard-focus a row in the **Project** breakdown and use the pencil action to
+open **Reclassify project**. On touch devices the action is always visible.
+
+The dialog works through the existing
+[worktree project mapping](/configuration/#worktree-project-mappings) system:
+
+- It lists the worktrees that produced the clicked row in the current Activity
+  view, grouped by machine and worktree evidence. A single group is
+  preselected; several groups require an explicit choice, because different
+  worktrees usually need different target projects.
+- The suggested **path prefix** covers the selected group's working
+  directories. You can edit it — for example, shorten it to cover sibling
+  worktrees of the same repository.
+- The **target project** typeahead suggests known projects and accepts a new
+  name. When the server normalizes the name (for example `sample-service`
+  becomes `sample_service`), the dialog shows the stored form before you
+  apply.
+- The **full archive impact** preview is live and authoritative: it counts
+  matching sessions across all dates for that machine, not just the current
+  Activity range. A prefix that touches more than one existing project shows a
+  warning with per-project counts — usually a sign the prefix is too broad. A
+  prefix matching zero sessions cannot be applied.
+
+**Apply** saves the rule and rewrites the matching sessions in one atomic
+step, then reloads the report. The rule stays active for future syncs and is
+managed under **Settings → Worktree mappings**, which records the label the
+row originally showed. On a read-only server (`pg serve` or `duckdb serve`)
+the action explains that reclassification happens on the writable archive that
+syncs the machine's sessions.
+
 ## Activity Insight
 
 At the bottom of the page, **Activity Insight** shows an existing global

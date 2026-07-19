@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"go.kenn.io/agentsview/internal/activity"
@@ -13,6 +14,9 @@ import (
 func (s *Server) registerActivityRoutes() {
 	group := newRouteGroup(s.api, "/api/v1/activity", "Activity")
 	get(s, group, "/report", "Get activity report", s.humaActivityReport)
+	get(s, group, "/project-reclassification/candidates",
+		"List project reclassification candidates",
+		s.humaActivityProjectReclassificationCandidates)
 }
 
 type activityReportInput struct {
@@ -32,16 +36,70 @@ type activityReportInput struct {
 	Automation string `query:"automation" default:"all" doc:"Automation class: all, interactive, or automated"`
 }
 
+type activityProjectReclassificationCandidatesInput struct {
+	Preset            string `query:"preset" enum:"day,week,month,custom" doc:"Range preset"`
+	Date              string `query:"date" format:"date" doc:"Calendar day (YYYY-MM-DD) for presets"`
+	From              string `query:"from" doc:"Range start (RFC3339) for custom ranges"`
+	To                string `query:"to" doc:"Range end (RFC3339) for custom ranges"`
+	Timezone          string `query:"timezone" doc:"IANA timezone name"`
+	Bucket            string `query:"bucket" enum:"5m,15m,1h,1d,1w" doc:"Timeline bucket size override"`
+	Project           string `query:"project" doc:"Current Activity project filter"`
+	GitBranch         string `query:"git_branch" doc:"Current Activity git branch filter"`
+	Agent             string `query:"agent" doc:"Current Activity agent filter"`
+	Machine           string `query:"machine" doc:"Current Activity machine filter"`
+	Automation        string `query:"automation" default:"all" doc:"Automation class"`
+	ClickedProject    string `query:"clicked_project" doc:"Clicked project display label"`
+	ClickedProjectKey string `query:"clicked_project_key" doc:"Opaque clicked project identity"`
+}
+
+type activitySelectionInput struct {
+	Preset, Date, From, To, Timezone, Bucket string
+	Project, GitBranch, Agent, Machine       string
+	Automation                               string
+}
+
+type resolvedActivitySelection struct {
+	query  activity.Query
+	filter db.AnalyticsFilter
+}
+
 func (s *Server) humaActivityReport(
 	ctx context.Context, in *activityReportInput,
 ) (*jsonOutput[activity.Report], error) {
+	selection, err := resolveActivitySelection(activitySelectionInput{
+		Preset: in.Preset, Date: in.Date, From: in.From, To: in.To,
+		Timezone: in.Timezone, Bucket: in.Bucket, Project: in.Project,
+		GitBranch: in.GitBranch, Agent: in.Agent, Machine: in.Machine,
+		Automation: in.Automation,
+	}, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	r, err := s.db.GetActivityReport(ctx, selection.filter, selection.query)
+	if err != nil {
+		if handled := handleHumaContextError(err); handled != nil {
+			return nil, handled
+		}
+		if handled := handleHumaReadOnly(err); handled != nil {
+			return nil, handled
+		}
+		return nil, internalError("activity report error", err)
+	}
+	return &jsonOutput[activity.Report]{Body: r}, nil
+}
+
+func resolveActivitySelection(
+	in activitySelectionInput,
+	now time.Time,
+) (resolvedActivitySelection, error) {
 	tz := in.Timezone
 	if tz == "" {
 		tz = "UTC"
 	}
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
-		return nil, apiError(http.StatusBadRequest, "invalid timezone: "+tz)
+		return resolvedActivitySelection{},
+			apiError(http.StatusBadRequest, "invalid timezone: "+tz)
 	}
 	input := activity.QueryInput{
 		Preset: in.Preset, Date: in.Date, From: in.From, To: in.To,
@@ -50,15 +108,15 @@ func (s *Server) humaActivityReport(
 	// Presets need an anchor date; default to today in the requested
 	// timezone, matching the prior day-only handler's behavior.
 	if input.Date == "" && input.From == "" {
-		input.Date = time.Now().In(loc).Format("2006-01-02")
+		input.Date = now.In(loc).Format("2006-01-02")
 	}
-	q, err := activity.ResolveQuery(input, time.Now())
+	q, err := activity.ResolveQuery(input, now)
 	if err != nil {
-		return nil, apiError(http.StatusBadRequest, err.Error())
+		return resolvedActivitySelection{}, apiError(http.StatusBadRequest, err.Error())
 	}
 	excludeAutomated, excludeInteractive, err := activityAutomationFilter(in.Automation)
 	if err != nil {
-		return nil, apiError(http.StatusBadRequest, err.Error())
+		return resolvedActivitySelection{}, apiError(http.StatusBadRequest, err.Error())
 	}
 	// The activity report intentionally includes one-shot sessions, unlike
 	// analytics which excludes them by default. The automation class is the
@@ -70,17 +128,43 @@ func (s *Server) humaActivityReport(
 		ExcludeAutomated:   excludeAutomated,
 		ExcludeInteractive: excludeInteractive,
 	}
-	r, err := s.db.GetActivityReport(ctx, f, q)
+	return resolvedActivitySelection{query: q, filter: f}, nil
+}
+
+func (s *Server) humaActivityProjectReclassificationCandidates(
+	ctx context.Context,
+	in *activityProjectReclassificationCandidatesInput,
+) (*jsonOutput[worktreeCandidatesResponse], error) {
+	if strings.TrimSpace(in.ClickedProjectKey) == "" {
+		return nil, apiError(http.StatusBadRequest, "clicked_project_key is required")
+	}
+	localDB, _, err := s.localWorktreeMappingHumaDB()
+	if err != nil {
+		return nil, err
+	}
+	selection, err := resolveActivitySelection(activitySelectionInput{
+		Preset: in.Preset, Date: in.Date, From: in.From, To: in.To,
+		Timezone: in.Timezone, Bucket: in.Bucket, Project: in.Project,
+		GitBranch: in.GitBranch, Agent: in.Agent, Machine: in.Machine,
+		Automation: in.Automation,
+	}, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	candidates, err := localDB.ListWorktreeReclassificationCandidates(ctx,
+		db.WorktreeCandidateRequest{
+			Filter: selection.filter, Query: selection.query,
+			ClickedProject: in.ClickedProject, ClickedProjectKey: in.ClickedProjectKey,
+		})
 	if err != nil {
 		if handled := handleHumaContextError(err); handled != nil {
 			return nil, handled
 		}
-		if handled := handleHumaReadOnly(err); handled != nil {
-			return nil, handled
-		}
-		return nil, internalError("activity report error", err)
+		return nil, internalError("list project reclassification candidates", err)
 	}
-	return &jsonOutput[activity.Report]{Body: r}, nil
+	return &jsonOutput[worktreeCandidatesResponse]{
+		Body: worktreeCandidatesResponse{Candidates: candidates},
+	}, nil
 }
 
 // activityAutomationFilter maps the activity report's automation query value to

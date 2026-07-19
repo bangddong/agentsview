@@ -1,5 +1,8 @@
 # CI Docker Build Retry Implementation Plan
 
+> **Status:** Complete. Shipped via scripts/retry.sh and PR #1111 (fix(ci):
+> retry transient SSH image builds); verified against origin/main 2026-07-17.
+
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development
 > (if subagents available) or superpowers:executing-plans to implement this
 > plan. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -22,7 +25,7 @@ ______________________________________________________________________
 
 - Create: `scripts/retry_test.sh`
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
     Create a temporary fake command that records its arguments and attempt count,
     fails twice, and succeeds on its third invocation. Assert that
@@ -36,7 +39,7 @@ ______________________________________________________________________
     Add a second fake command that always exits 17. Assert that the helper invokes
     it exactly three times and returns exit status 17.
 
-- [ ] **Step 2: Run the test to verify it fails for the missing helper**
+- [x] **Step 2: Run the test to verify it fails for the missing helper**
 
     Run: `bash scripts/retry_test.sh`
 
@@ -50,7 +53,7 @@ ______________________________________________________________________
 
 - Test: `scripts/retry_test.sh`
 
-- [ ] **Step 1: Add the minimal retry loop**
+- [x] **Step 1: Add the minimal retry loop**
 
     Accept a maximum-attempt count and delay in seconds followed by the command
     and its arguments. Run the command until it succeeds or reaches the limit,
@@ -58,7 +61,7 @@ ______________________________________________________________________
     concise retry message to standard error, and return the final command's exit
     status when exhausted.
 
-- [ ] **Step 2: Run the behavioral test to verify it passes**
+- [x] **Step 2: Run the behavioral test to verify it passes**
 
     Run: `bash scripts/retry_test.sh`
 
@@ -72,16 +75,16 @@ ______________________________________________________________________
 
 - Modify: `.github/workflows/ci.yml:282-283`
 
-- [ ] **Step 1: Add the retry test to the scripts job**
+- [x] **Step 1: Add the retry test to the scripts job**
 
     Run `bash scripts/retry_test.sh` alongside the existing shell-script tests.
 
-- [ ] **Step 2: Wrap the SSH image build**
+- [x] **Step 2: Wrap the SSH image build**
 
     Replace the direct build invocation with
     `bash scripts/retry.sh 3 10 docker build -t agentsview-sshd -f testdata/ssh/Dockerfile .`.
 
-- [ ] **Step 3: Run focused validation**
+- [x] **Step 3: Run focused validation**
 
     Run: `bash scripts/retry_test.sh`
 
@@ -97,17 +100,17 @@ ______________________________________________________________________
 
 - Commit the design, plan, helper, test, and workflow changes.
 
-- [ ] **Step 1: Review and scrub the outgoing diff and messages**
+- [x] **Step 1: Review and scrub the outgoing diff and messages**
 
     Verify that no private paths, identities, hostnames, or unrelated changes are
     present.
 
-- [ ] **Step 2: Commit the implementation**
+- [x] **Step 2: Commit the implementation**
 
     Use a focused conventional commit explaining why transient registry
     availability should not invalidate successful integration work.
 
-- [ ] **Step 3: Push and open a pull request**
+- [x] **Step 3: Push and open a pull request**
 
     As explicitly requested by the user, push the current feature branch and open
     a rationale-first PR whose description is a summary only, without a
