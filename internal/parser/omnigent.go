@@ -989,42 +989,44 @@ func omnigentUsageEvents(
 	if err != nil || strings.TrimSpace(text) == "" {
 		return nil
 	}
+	// Cost fields are *float64 to track presence: omnigent only records
+	// total_cost_usd when the child harness prices its own usage, and an
+	// absent cost must stay NULL so catalog-based token pricing applies
+	// instead of an authoritative $0.
 	var usage struct {
-		InputTokens  int     `json:"input_tokens"`
-		OutputTokens int     `json:"output_tokens"`
-		TotalCostUSD float64 `json:"total_cost_usd"`
+		InputTokens  int      `json:"input_tokens"`
+		OutputTokens int      `json:"output_tokens"`
+		TotalCostUSD *float64 `json:"total_cost_usd"`
 		ByModel      map[string]struct {
-			InputTokens  int     `json:"input_tokens"`
-			OutputTokens int     `json:"output_tokens"`
-			TotalCostUSD float64 `json:"total_cost_usd"`
+			InputTokens  int      `json:"input_tokens"`
+			OutputTokens int      `json:"output_tokens"`
+			TotalCostUSD *float64 `json:"total_cost_usd"`
 		} `json:"by_model"`
 	}
 	if json.Unmarshal([]byte(text), &usage) != nil {
 		return nil
 	}
 	if usage.InputTokens == 0 && usage.OutputTokens == 0 &&
-		usage.TotalCostUSD == 0 && len(usage.ByModel) == 0 {
+		usage.TotalCostUSD == nil && len(usage.ByModel) == 0 {
 		return nil
 	}
 
 	if len(usage.ByModel) > 0 {
 		var events []ParsedUsageEvent
 		for model, m := range usage.ByModel {
-			cost := m.TotalCostUSD
 			events = append(events, ParsedUsageEvent{
 				SessionID:    sessionID,
 				Source:       "session",
 				Model:        model,
 				InputTokens:  m.InputTokens,
 				OutputTokens: m.OutputTokens,
-				CostUSD:      &cost,
+				CostUSD:      m.TotalCostUSD,
 				DedupKey:     sessionID + "|usage|" + model,
 			})
 		}
 		return events
 	}
 
-	cost := usage.TotalCostUSD
 	fallbackModel = strings.TrimSpace(fallbackModel)
 	if fallbackModel == "" {
 		fallbackModel = "unknown"
@@ -1035,7 +1037,7 @@ func omnigentUsageEvents(
 		Model:        fallbackModel,
 		InputTokens:  usage.InputTokens,
 		OutputTokens: usage.OutputTokens,
-		CostUSD:      &cost,
+		CostUSD:      usage.TotalCostUSD,
 		DedupKey:     sessionID + "|usage|" + fallbackModel,
 	}}
 }

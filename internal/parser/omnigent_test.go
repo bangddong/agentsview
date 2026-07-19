@@ -967,6 +967,8 @@ func TestOmnigentBinaryIDGenerationParses(t *testing.T) {
 	require.Len(t, main.UsageEvents, 1,
 		"framed session_usage must decode into usage events")
 	assert.Equal(t, "omnigent-large", main.UsageEvents[0].Model)
+	assert.Nil(t, main.UsageEvents[0].CostUSD,
+		"absent total_cost_usd must stay nil so catalog pricing applies")
 
 	sub, ok := byID[omnigentIDPrefix+"0:"+omnigentBinarySubHex]
 	require.True(t, ok, "sub-agent conversation must parse under its hex ID")
@@ -1010,6 +1012,57 @@ func TestOmnigentBinaryIDChangedPathSweepAndTombstones(t *testing.T) {
 		"one changed member plus one deleted-member tombstone")
 	assert.Equal(t, "0:"+omnigentBinaryConvHex, changed[0].MemberID)
 	assert.Equal(t, "0:"+omnigentBinaryGoneHex, changed[1].MemberID)
+}
+
+func TestOmnigentUsageEventsTrackCostPresence(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		payload  string
+		model    string
+		wantCost *float64
+	}{
+		{
+			name:    "aggregate without cost stays nil",
+			payload: `{"input_tokens":10,"output_tokens":5}`,
+			model:   "fallback",
+		},
+		{
+			name: "by_model without cost stays nil",
+			payload: `{"by_model":{"m1":` +
+				`{"input_tokens":10,"output_tokens":5}}}`,
+			model: "m1",
+		},
+		{
+			name: "explicit zero cost is preserved",
+			payload: `{"by_model":{"m1":` +
+				`{"input_tokens":10,"output_tokens":5,"total_cost_usd":0}}}`,
+			model:    "m1",
+			wantCost: new(float64),
+		},
+		{
+			name: "recorded cost is preserved",
+			payload: `{"input_tokens":10,"output_tokens":5,` +
+				`"total_cost_usd":1.25}`,
+			model:    "fallback",
+			wantCost: func() *float64 { v := 1.25; return &v }(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := omnigentUsageEvents(
+				"omnigent:s1", "fallback", []byte(tc.payload),
+			)
+			require.Len(t, events, 1)
+			assert.Equal(t, tc.model, events[0].Model)
+			assert.Equal(t, 10, events[0].InputTokens)
+			if tc.wantCost == nil {
+				assert.Nil(t, events[0].CostUSD,
+					"unknown cost must stay NULL for catalog pricing")
+				return
+			}
+			require.NotNil(t, events[0].CostUSD)
+			assert.InDelta(t, *tc.wantCost, *events[0].CostUSD, 0.0001)
+		})
+	}
 }
 
 func TestOmnigentShmEventDoesNotResolveToContainer(t *testing.T) {
