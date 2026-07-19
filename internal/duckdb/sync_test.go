@@ -2186,23 +2186,6 @@ func assertDuckDBCountWhere(
 	assert.Equal(t, want, got, table)
 }
 
-func assertDuckDBSnapshotCount(
-	t *testing.T,
-	conn *sql.DB,
-	archiveID, generation, sessionID, project string,
-	want int,
-) {
-	t.Helper()
-	var got int
-	require.NoError(t, conn.QueryRow(`
-		SELECT COUNT(*) FROM source_session_project_identity_snapshots
-		WHERE source_archive_id = ? AND source_database_generation = ?
-		  AND source_session_id = ? AND project = ?`,
-		archiveID, generation, sessionID, project,
-	).Scan(&got))
-	assert.Equal(t, want, got, "source_session_project_identity_snapshots")
-}
-
 func TestSyncResultDurationIsSet(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
@@ -2248,7 +2231,9 @@ func TestDuckPushWritesSessionProvenance(t *testing.T) {
 	conn, err := Open(path)
 	require.NoError(t, err)
 	_, err = conn.ExecContext(ctx,
-		`UPDATE sessions SET source_archive_id = '' WHERE id = ?`, "sess-1")
+		`UPDATE sessions
+		 SET source_archive_id = '', agentsview_push_fingerprint = NULL
+		 WHERE id = ?`, "sess-1")
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 
