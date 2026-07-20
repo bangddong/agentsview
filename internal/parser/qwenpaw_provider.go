@@ -17,7 +17,7 @@ import (
 // StoredPathFallbackRoot; ForceReplace mirrors the wholesale-rewrite parse
 // outcome.
 func newQwenPawProviderFactory(def AgentDef) ProviderFactory {
-	return NewSourceSetFactory(
+	return NewStreamingSourceSetFactory(
 		def,
 		qwenPawProviderCapabilities(),
 		func(cfg ProviderConfig) SourceSet { return newQwenPawSourceSet(cfg.Roots) },

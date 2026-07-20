@@ -24,7 +24,7 @@ type openClaudeSourceSet struct {
 }
 
 func newOpenClaudeProviderFactory(def AgentDef) ProviderFactory {
-	return NewSourceSetFactory(
+	return NewStreamingSourceSetFactory(
 		def,
 		openClaudeProviderCapabilities(),
 		func(cfg ProviderConfig) SourceSet {
@@ -37,6 +37,7 @@ func openClaudeProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,
@@ -86,6 +87,30 @@ func (s openClaudeSourceSet) Discover(ctx context.Context) ([]SourceRef, error) 
 	}
 	sortJSONLSources(sources)
 	return sources, nil
+}
+
+func (s openClaudeSourceSet) DiscoverEach(
+	ctx context.Context, yield func(SourceRef) error,
+) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+				return nil
+			}
+			source, ok := s.sourceRef(root, path)
+			if !ok {
+				return nil
+			}
+			return yield(source)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s openClaudeSourceSet) discoveredSourceRef(

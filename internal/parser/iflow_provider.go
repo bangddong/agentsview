@@ -13,7 +13,7 @@ import (
 // SourceSet so it rides the generic factory; RawSessionIDForLookup strips the
 // subagent suffix from stored IDs so FindSource still matches the base file.
 func newIflowProviderFactory(def AgentDef) ProviderFactory {
-	return NewSourceSetFactory(
+	return NewStreamingSourceSetFactory(
 		def,
 		iflowProviderCapabilities(),
 		func(cfg ProviderConfig) SourceSet { return newIflowSourceSet(cfg.Roots) },

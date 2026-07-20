@@ -10,7 +10,7 @@ import (
 // lookup, and fingerprinting come from JSONLSourceSet, and the ParseFile option
 // makes that source set a full SourceSet so it rides the generic factory.
 func newAmpProviderFactory(def AgentDef) ProviderFactory {
-	return NewSourceSetFactory(
+	return NewStreamingSourceSetFactory(
 		def,
 		ampProviderCapabilities(),
 		func(cfg ProviderConfig) SourceSet { return newAmpSourceSet(cfg.Roots) },

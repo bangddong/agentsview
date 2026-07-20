@@ -16,7 +16,7 @@ import (
 // factory; RawSessionIDSourceFiles reconstructs the file path for the old
 // colon-joined IDs, which the filename-stem discovery scan cannot match.
 func newKiroIDEProviderFactory(def AgentDef) ProviderFactory {
-	return NewSourceSetFactory(
+	return NewStreamingSourceSetFactory(
 		def,
 		kiroIDEProviderCapabilities(),
 		func(cfg ProviderConfig) SourceSet { return newKiroIDESourceSet(cfg.Roots) },

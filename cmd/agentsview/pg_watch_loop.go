@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -21,6 +23,16 @@ const (
 // process exit indefinitely.
 const defaultFlushTimeout = 30 * time.Second
 
+const maxPushWatchDegradedRoots = 128
+
+var errPushWatchFloorInactive = errors.New("push watch interval floor is inactive")
+
+type pushWatchCoverageDiagnostics struct {
+	RootCount int
+	Overflow  bool
+	Floor     bool
+}
+
 // pushLoop coalesces file-change notifications and a periodic floor
 // tick into serialized pushes. A single goroutine (Run) performs all
 // pushes, so a push is never concurrent with another push.
@@ -29,24 +41,66 @@ const defaultFlushTimeout = 30 * time.Second
 // under test. In production, after is time.After and floor is a
 // time.Ticker channel.
 type pushLoop struct {
-	debounce time.Duration
-	dirty    chan struct{}
-	floor    <-chan time.Time
-	after    func(time.Duration) <-chan time.Time
-	push     func(ctx context.Context, reason pushReason) error
-	label    string
+	debounce         time.Duration
+	dirty            chan struct{}
+	floor            <-chan time.Time
+	after            func(time.Duration) <-chan time.Time
+	push             func(ctx context.Context, reason pushReason) error
+	label            string
+	pendingMu        sync.Mutex
+	pending          bool
+	waiters          []chan error
+	coverageMu       sync.Mutex
+	degradedRoots    map[string]struct{}
+	coverageOverflow bool
 	// flushTimeout bounds the final shutdown-flush push. Zero means
 	// no bound (used in tests that inject a fake pusher).
 	flushTimeout time.Duration
 }
 
-// newPushLoop builds a production loop with a real debounce timer and
-// floor ticker. The caller must Stop the returned ticker.
-func newPushLoop(
-	debounce, interval time.Duration,
-	push func(context.Context, pushReason) error,
-) (*pushLoop, *time.Ticker) {
-	return newPushLoopWithLabel("pg watch", debounce, interval, push)
+func (l *pushLoop) NotifyCoverageDegraded(roots []string) error {
+	if l.floor == nil {
+		return errPushWatchFloorInactive
+	}
+	l.coverageMu.Lock()
+	if l.degradedRoots == nil {
+		l.degradedRoots = make(map[string]struct{})
+	}
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		if _, exists := l.degradedRoots[root]; exists {
+			continue
+		}
+		if len(l.degradedRoots) >= maxPushWatchDegradedRoots {
+			l.coverageOverflow = true
+			continue
+		}
+		l.degradedRoots[root] = struct{}{}
+	}
+	diagnostics := pushWatchCoverageDiagnostics{
+		RootCount: len(l.degradedRoots),
+		Overflow:  l.coverageOverflow,
+		Floor:     true,
+	}
+	l.coverageMu.Unlock()
+	log.Printf(
+		"%s: watcher coverage degraded root_count=%d overflow=%t interval_floor=%t",
+		l.label, diagnostics.RootCount, diagnostics.Overflow, diagnostics.Floor,
+	)
+	l.NotifyDirty()
+	return nil
+}
+
+func (l *pushLoop) coverageDiagnostics() pushWatchCoverageDiagnostics {
+	l.coverageMu.Lock()
+	defer l.coverageMu.Unlock()
+	return pushWatchCoverageDiagnostics{
+		RootCount: len(l.degradedRoots),
+		Overflow:  l.coverageOverflow,
+		Floor:     l.floor != nil,
+	}
 }
 
 func newPushLoopWithLabel(
@@ -69,6 +123,26 @@ func newPushLoopWithLabel(
 // NotifyDirty signals that local data changed. Non-blocking: a burst
 // collapses into a single pending push.
 func (l *pushLoop) NotifyDirty() {
+	l.pendingMu.Lock()
+	l.pending = true
+	l.pendingMu.Unlock()
+	l.signalDirty()
+}
+
+// NotifyDirtyWithAck marks the loop dirty and returns immediately. The result
+// channel completes only after a push covering this generation succeeds;
+// failed pushes retain both the dirty marker and every waiter for a retry.
+func (l *pushLoop) NotifyDirtyWithAck() <-chan error {
+	waiter := make(chan error, 1)
+	l.pendingMu.Lock()
+	l.pending = true
+	l.waiters = append(l.waiters, waiter)
+	l.pendingMu.Unlock()
+	l.signalDirty()
+	return waiter
+}
+
+func (l *pushLoop) signalDirty() {
 	select {
 	case l.dirty <- struct{}{}:
 	default:
@@ -111,7 +185,36 @@ func (l *pushLoop) Run(ctx context.Context) {
 }
 
 func (l *pushLoop) doPush(ctx context.Context, reason pushReason) {
+	hadPending, waiters := l.claimPending()
 	if err := l.push(ctx, reason); err != nil {
 		log.Printf("%s: push (%s) failed: %v", l.label, reason, err)
+		if hadPending {
+			l.restorePending(waiters)
+		}
+		return
 	}
+	for _, waiter := range waiters {
+		waiter <- nil
+		close(waiter)
+	}
+}
+
+func (l *pushLoop) claimPending() (bool, []chan error) {
+	l.pendingMu.Lock()
+	defer l.pendingMu.Unlock()
+	hadPending := l.pending
+	waiters := l.waiters
+	l.pending = false
+	l.waiters = nil
+	return hadPending, waiters
+}
+
+func (l *pushLoop) restorePending(waiters []chan error) {
+	l.pendingMu.Lock()
+	l.pending = true
+	if len(waiters) > 0 {
+		l.waiters = append(waiters, l.waiters...)
+	}
+	l.pendingMu.Unlock()
+	l.signalDirty()
 }

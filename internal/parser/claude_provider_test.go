@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -172,6 +173,29 @@ func TestClaudeProviderDiscoversSymlinkedProjectDirectory(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, subagentPath, found.DisplayPath)
+}
+
+func TestClaudeProviderStreamingDiscoveryStopsAfterYieldError(t *testing.T) {
+	root := t.TempDir()
+	for _, project := range []string{"-Users-dev-code-one", "-Users-dev-code-two"} {
+		writeSourceFile(
+			t, filepath.Join(root, project, "session.jsonl"),
+			claudeProviderFixture("streamed"),
+		)
+	}
+	provider, ok := NewProvider(AgentClaude, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discoverer, ok := provider.(StreamingDiscoverer)
+	require.True(t, ok)
+
+	stop := errors.New("stop discovery")
+	calls := 0
+	err := discoverer.DiscoverEach(t.Context(), func(SourceRef) error {
+		calls++
+		return stop
+	})
+	require.ErrorIs(t, err, stop)
+	assert.Equal(t, 1, calls)
 }
 
 func TestClaudeProviderParse(t *testing.T) {

@@ -412,6 +412,35 @@ func TestPushRoutesAreStreaming(t *testing.T) {
 	}
 }
 
+// TestPushRoutesReturn503WhileWriterClosedForSSE pins that a push during the
+// write barrier is rejected before the stream body flushes a 200: the daemon
+// CLI always negotiates SSE, so the 503 + Retry-After must be decided up
+// front rather than emitted as a generic SSE error event.
+func TestPushRoutesReturn503WhileWriterClosedForSSE(t *testing.T) {
+	s := testServer(t, 30*time.Second)
+	database := s.db.(*db.DB)
+	require.NoError(t, database.CloseWriter())
+	defer func() { assert.NoError(t, database.ReopenWriter()) }()
+
+	for _, path := range []string{"/api/v1/push/pg", "/api/v1/push/duckdb"} {
+		req := httptest.NewRequest(
+			http.MethodPost, path, strings.NewReader(`{"full":false}`),
+		)
+		req.Host = "127.0.0.1:0"
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusServiceUnavailable, w.Code,
+			"%s body: %s", path, w.Body.String())
+		assert.Equal(t, "5", w.Header().Get("Retry-After"),
+			"%s: a writer-closed push must advertise Retry-After", path)
+	}
+}
+
 // TestNewPushProgressStreamSenderThrottles pins the SSE fan-out throttle: the
 // session loop reports per session, and forwarding every report would emit
 // one SSE event per row.

@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -519,26 +521,21 @@ func TestNewDaemonIdleTrackerEnvOverridesConfig(t *testing.T) {
 }
 
 type fakeUnwatchedPollSyncer struct {
-	roots     []string
-	since     time.Time
 	calls     int
 	callRoots [][]string
-	callSince []time.Time
+	callFull  []bool
 }
 
-func (f *fakeUnwatchedPollSyncer) SyncRootsSince(
-	ctx context.Context, roots []string, since time.Time,
-	onProgress agentsync.ProgressFunc,
-) agentsync.SyncStats {
+func (f *fakeUnwatchedPollSyncer) ReconcileWatchRoots(
+	_ context.Context, roots []string, full bool,
+) error {
 	f.calls++
-	f.roots = append([]string(nil), roots...)
-	f.since = since
 	f.callRoots = append(f.callRoots, append([]string(nil), roots...))
-	f.callSince = append(f.callSince, since)
-	return agentsync.SyncStats{}
+	f.callFull = append(f.callFull, full)
+	return nil
 }
 
-func TestPollUnwatchedRootsOnceUsesScopedFullSync(t *testing.T) {
+func TestPollUnwatchedRootsOnceUsesScopedAuthoritativeReconciliation(t *testing.T) {
 	fake := &fakeUnwatchedPollSyncer{}
 	roots := []string{"/tmp/claude", "/tmp/codex"}
 
@@ -547,9 +544,9 @@ func TestPollUnwatchedRootsOnceUsesScopedFullSync(t *testing.T) {
 
 	require.Equal(t, 2, fake.calls)
 	assert.Equal(t, roots, fake.callRoots[0])
-	assert.True(t, fake.callSince[0].IsZero(), "first poll cutoff = %v", fake.callSince[0])
+	assert.False(t, fake.callFull[0])
 	assert.Equal(t, roots, fake.callRoots[1])
-	assert.True(t, fake.callSince[1].IsZero(), "second poll cutoff = %v", fake.callSince[1])
+	assert.False(t, fake.callFull[1])
 }
 
 func TestCollectWatchRootsPreservesDirsSharingWatchRoot(t *testing.T) {
@@ -566,10 +563,37 @@ func TestCollectWatchRootsPreservesDirsSharingWatchRoot(t *testing.T) {
 
 	roots, unwatchedDirs := collectWatchRoots(cfg)
 
-	require.Empty(t, unwatchedDirs, "unwatched dirs before watcher setup")
-	require.Len(t, roots, 1, "shared watch root should be represented once")
-	assert.Equal(t, parent, roots[0].root)
-	assert.ElementsMatch(t, []string{sessionsDir, archivedDir}, roots[0].dirs)
+	assert.ElementsMatch(t, []string{sessionsDir, archivedDir}, unwatchedDirs,
+		"missing roots retain polling until native activation completes")
+	shared, ok := findCollectedWatchRoot(roots, parent)
+	require.True(t, ok, "shared watch root should be represented once")
+	assert.False(t, shared.recursive, "provider parent root is explicitly shallow")
+	assert.True(t, shared.exists)
+	assert.ElementsMatch(t, []watchScope{
+		{agent: parser.AgentCodex, syncDir: sessionsDir},
+		{agent: parser.AgentCodex, syncDir: archivedDir},
+	}, shared.scopes)
+	assert.ElementsMatch(t, []agentsync.WatchScope{
+		{Agent: string(parser.AgentCodex), SyncDir: sessionsDir},
+		{Agent: string(parser.AgentCodex), SyncDir: archivedDir},
+	}, shared.registeredRoot().Scopes,
+		"watcher registration must retain every configured polling scope")
+
+	sessions, ok := findCollectedWatchRoot(roots, sessionsDir)
+	require.True(t, ok, "missing sessions root remains in the logical plan")
+	assert.True(t, sessions.recursive)
+	assert.False(t, sessions.exists)
+	assert.Equal(t, []watchScope{{agent: parser.AgentCodex, syncDir: sessionsDir}}, sessions.scopes)
+	assert.Equal(t, []string{sessionsDir}, sessions.pendingPollingDirs)
+	assert.Empty(t, sessions.persistentPollingDirs)
+
+	archived, ok := findCollectedWatchRoot(roots, archivedDir)
+	require.True(t, ok, "missing archive root remains in the logical plan")
+	assert.True(t, archived.recursive)
+	assert.False(t, archived.exists)
+	assert.Equal(t, []watchScope{{agent: parser.AgentCodex, syncDir: archivedDir}}, archived.scopes)
+	assert.Equal(t, []string{archivedDir}, archived.pendingPollingDirs)
+	assert.Empty(t, archived.persistentPollingDirs)
 }
 
 func TestCollectWatchRootsPollsRecursiveSymlinkProviderRoot(t *testing.T) {
@@ -589,16 +613,18 @@ func TestCollectWatchRootsPollsRecursiveSymlinkProviderRoot(t *testing.T) {
 	roots, unwatchedDirs := collectWatchRoots(cfg)
 
 	require.Len(t, roots, 2)
-	assert.Equal(t, root, roots[0].root)
-	assert.True(t, roots[0].shallow)
-	assert.Equal(t, []string{root}, roots[0].dirs)
+	assert.Equal(t, root, roots[0].path)
+	assert.False(t, roots[0].recursive)
+	assert.True(t, roots[0].exists)
+	assert.Equal(t, []watchScope{{agent: parser.AgentVSCopilot, syncDir: root}}, roots[0].scopes)
 	assert.Equal(
 		t,
 		filepath.Join(root, ".VS", "SampleApp", "copilot-chat", "thread", "sessions"),
-		roots[1].root,
+		roots[1].path,
 	)
-	assert.True(t, roots[1].shallow)
-	assert.Equal(t, []string{root}, roots[1].dirs)
+	assert.False(t, roots[1].recursive)
+	assert.True(t, roots[1].exists)
+	assert.Equal(t, []watchScope{{agent: parser.AgentVSCopilot, syncDir: root}}, roots[1].scopes)
 	assert.ElementsMatch(t, []string{root}, unwatchedDirs)
 }
 
@@ -1064,12 +1090,14 @@ func TestCollectWatchRootsHermesSessionsWatchesStateDBParent(t *testing.T) {
 
 	require.Empty(t, unwatchedDirs, "unwatched dirs before watcher setup")
 	require.Len(t, roots, 2)
-	assert.Equal(t, root, roots[0].root)
-	assert.True(t, roots[0].shallow)
-	assert.Equal(t, []string{sessionsDir}, roots[0].dirs)
-	assert.Equal(t, sessionsDir, roots[1].root)
-	assert.False(t, roots[1].shallow)
-	assert.Equal(t, []string{sessionsDir}, roots[1].dirs)
+	assert.Equal(t, root, roots[0].path)
+	assert.False(t, roots[0].recursive)
+	assert.True(t, roots[0].exists)
+	assert.Equal(t, []watchScope{{agent: parser.AgentHermes, syncDir: sessionsDir}}, roots[0].scopes)
+	assert.Equal(t, sessionsDir, roots[1].path)
+	assert.True(t, roots[1].recursive)
+	assert.True(t, roots[1].exists)
+	assert.Equal(t, []watchScope{{agent: parser.AgentHermes, syncDir: sessionsDir}}, roots[1].scopes)
 }
 
 func TestCollectWatchRootsUsesCoworkProviderRecursiveRoot(t *testing.T) {
@@ -1085,9 +1113,10 @@ func TestCollectWatchRootsUsesCoworkProviderRecursiveRoot(t *testing.T) {
 	require.Empty(t, unwatchedDirs, "cowork root should be watched directly")
 	got, ok := findCollectedWatchRoot(roots, root)
 	require.True(t, ok, "cowork provider WatchPlan root not collected")
-	assert.False(t, got.shallow,
+	assert.True(t, got.recursive,
 		"cowork provider recursive WatchPlan must override legacy ShallowWatch")
-	assert.Equal(t, []string{root}, got.dirs)
+	assert.True(t, got.exists)
+	assert.Equal(t, []watchScope{{agent: parser.AgentCowork, syncDir: root}}, got.scopes)
 }
 
 func TestCollectWatchRootsUsesGeminiProviderMetadataRoot(t *testing.T) {
@@ -1105,10 +1134,12 @@ func TestCollectWatchRootsUsesGeminiProviderMetadataRoot(t *testing.T) {
 	require.Empty(t, unwatchedDirs, "all gemini provider roots exist")
 	metadataRoot, ok := findCollectedWatchRoot(roots, root)
 	require.True(t, ok, "gemini provider metadata root not collected")
-	assert.True(t, metadataRoot.shallow)
+	assert.False(t, metadataRoot.recursive)
+	assert.True(t, metadataRoot.exists)
 	tmp, ok := findCollectedWatchRoot(roots, tmpRoot)
 	require.True(t, ok, "gemini provider recursive tmp root not collected")
-	assert.False(t, tmp.shallow)
+	assert.True(t, tmp.recursive)
+	assert.True(t, tmp.exists)
 }
 
 func TestCollectWatchRootsUsesAntigravityCLIHistoryRoot(t *testing.T) {
@@ -1127,15 +1158,15 @@ func TestCollectWatchRootsUsesAntigravityCLIHistoryRoot(t *testing.T) {
 	require.Empty(t, unwatchedDirs, "all antigravity cli provider roots exist")
 	historyRoot, ok := findCollectedWatchRoot(roots, root)
 	require.True(t, ok, "antigravity cli history.jsonl root not collected")
-	assert.True(t, historyRoot.shallow)
+	assert.False(t, historyRoot.recursive)
 	conversations, ok := findCollectedWatchRoot(
 		roots, filepath.Join(root, "conversations"),
 	)
 	require.True(t, ok, "antigravity cli conversations root not collected")
-	assert.True(t, conversations.shallow)
+	assert.False(t, conversations.recursive)
 	brain, ok := findCollectedWatchRoot(roots, filepath.Join(root, "brain"))
 	require.True(t, ok, "antigravity cli brain root not collected")
-	assert.False(t, brain.shallow)
+	assert.True(t, brain.recursive)
 }
 
 func TestCollectWatchRootsIncludesDevinProviderRootsForNonFileAgent(t *testing.T) {
@@ -1154,15 +1185,42 @@ func TestCollectWatchRootsIncludesDevinProviderRootsForNonFileAgent(t *testing.T
 	require.Empty(t, unwatchedDirs)
 	cliRoot, ok := findCollectedWatchRoot(roots, filepath.Join(root, "cli"))
 	require.True(t, ok, "devin cli root not collected")
-	assert.True(t, cliRoot.shallow)
-	assert.Equal(t, []string{root}, cliRoot.dirs)
+	assert.False(t, cliRoot.recursive)
+	assert.True(t, cliRoot.exists)
+	assert.Equal(t, []watchScope{{agent: parser.AgentDevin, syncDir: root}}, cliRoot.scopes)
 	transcriptsRoot, ok := findCollectedWatchRoot(roots, filepath.Join(root, "cli", "transcripts"))
 	require.True(t, ok, "devin transcripts root not collected")
-	assert.True(t, transcriptsRoot.shallow)
-	assert.Equal(t, []string{root}, transcriptsRoot.dirs)
+	assert.False(t, transcriptsRoot.recursive)
+	assert.True(t, transcriptsRoot.exists)
+	assert.Equal(t, []watchScope{{agent: parser.AgentDevin, syncDir: root}}, transcriptsRoot.scopes)
 }
 
-func TestCollectWatchRootsMarksDevinRootUnwatchedWhenProviderPathsMissing(t *testing.T) {
+func TestCollectWatchRootsTracksExactAgentsForSharedRoot(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Config{AgentDirs: map[parser.AgentType][]string{
+		parser.AgentClaude: {root},
+		parser.AgentCodex:  {root},
+	}}
+
+	roots, unwatchedDirs := collectWatchRoots(cfg)
+
+	require.Empty(t, unwatchedDirs)
+	shared, ok := findCollectedWatchRoot(roots, root)
+	require.True(t, ok)
+	assert.True(t, shared.recursive,
+		"a recursive owner must preserve recursive physical coverage")
+	assert.ElementsMatch(t, []watchScope{
+		{agent: parser.AgentClaude, syncDir: root},
+		{agent: parser.AgentCodex, syncDir: root},
+	}, shared.scopes)
+	assert.ElementsMatch(t, []agentsync.WatchScope{
+		{Agent: string(parser.AgentClaude), SyncDir: root},
+		{Agent: string(parser.AgentCodex), SyncDir: root},
+	}, shared.registeredRoot().Scopes,
+		"watcher registration must retain every rename-prefix owner")
+}
+
+func TestCollectWatchRootsPreservesMissingProviderRoots(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Config{
 		AgentDirs: map[parser.AgentType][]string{
@@ -1172,14 +1230,24 @@ func TestCollectWatchRootsMarksDevinRootUnwatchedWhenProviderPathsMissing(t *tes
 
 	roots, unwatchedDirs := collectWatchRoots(cfg)
 
-	assert.Empty(t, roots)
+	require.Len(t, roots, 2)
+	cliRoot, ok := findCollectedWatchRoot(roots, filepath.Join(root, "cli"))
+	require.True(t, ok)
+	assert.False(t, cliRoot.recursive)
+	assert.False(t, cliRoot.exists)
+	assert.Equal(t, []watchScope{{agent: parser.AgentDevin, syncDir: root}}, cliRoot.scopes)
+	transcriptsRoot, ok := findCollectedWatchRoot(roots, filepath.Join(root, "cli", "transcripts"))
+	require.True(t, ok)
+	assert.False(t, transcriptsRoot.recursive)
+	assert.False(t, transcriptsRoot.exists)
+	assert.Equal(t, []watchScope{{agent: parser.AgentDevin, syncDir: root}}, transcriptsRoot.scopes)
 	assert.Equal(t, []string{root}, unwatchedDirs)
 }
 
-func TestMissingWatchRootCoverageDoesNotTreatShallowAncestorAsRecursive(t *testing.T) {
+func TestPathCoveredByAnyWatchRootCreationDoesNotTreatShallowAncestorAsRecursive(t *testing.T) {
 	root := filepath.Clean(filepath.Join(t.TempDir(), "state"))
-	shallowRoots := []watchRoot{{root: root, shallow: true}}
-	recursiveRoots := []watchRoot{{root: root, shallow: false}}
+	shallowRoots := []watchRoot{{path: root, recursive: false, exists: true}}
+	recursiveRoots := []watchRoot{{path: root, recursive: true, exists: true}}
 
 	assert.True(t,
 		pathCoveredByAnyWatchRootCreation(filepath.Join(root, "sessions"), shallowRoots),
@@ -1192,10 +1260,332 @@ func TestMissingWatchRootCoverageDoesNotTreatShallowAncestorAsRecursive(t *testi
 		"recursive roots cover nested missing roots")
 }
 
+func TestStartFileWatcherSuppressesPendingPollingWhenLifecycleIsOwned(t *testing.T) {
+	root := t.TempDir()
+	pending := watchRoot{
+		path:               filepath.Join(root, "state", "sessions"),
+		recursive:          true,
+		scopes:             []watchScope{{agent: parser.AgentDevin, syncDir: root}},
+		pendingPollingDirs: []string{root},
+	}
+
+	got := accountRegisteredWatchRoots(
+		[]string{root}, []watchRoot{pending},
+		[]agentsync.RecursiveWatchResult{{
+			Watched:                   1,
+			MissingRootLifecycleOwned: true,
+		}},
+	)
+
+	assert.Empty(t, got,
+		"native lifecycle ownership replaces the startup polling obligation")
+	assert.Empty(t, watchPollingObligations(
+		[]watchRoot{pending},
+		[]agentsync.RecursiveWatchResult{{
+			Watched:                   1,
+			MissingRootLifecycleOwned: true,
+		}},
+		got,
+	), "owned missing roots must not schedule authoritative polling")
+}
+
+func TestStartupReconciliationHandlerCheckpointsBeforeOpeningDispatch(t *testing.T) {
+	ctx := t.Context()
+	order := make([]string, 0, 2)
+	handler := newStartupReconciliationHandler(
+		ctx,
+		func(got context.Context) error {
+			assert.Equal(t, ctx, got)
+			order = append(order, "checkpoint")
+			return nil
+		},
+		func() { order = append(order, "open") },
+	)
+
+	handler(agentsync.SyncStats{}, nil)
+	assert.Equal(t, []string{"checkpoint", "open"}, order)
+}
+
+func TestInitialSyncWatcherStartupOwnerReconciles(t *testing.T) {
+	database := dbtest.OpenTestDB(t)
+	reconciled := make(chan agentsync.SyncStats, 1)
+	engine := agentsync.NewEngine(database, agentsync.EngineConfig{
+		OnStartupReconciled: func(stats agentsync.SyncStats, err error) {
+			require.NoError(t, err)
+			reconciled <- stats
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	stats := runInitialSync(t.Context(), engine, nil)
+
+	assert.False(t, stats.Aborted)
+	select {
+	case got := <-reconciled:
+		assert.Equal(t, stats, got)
+	case <-time.After(time.Second):
+		require.FailNow(t, "initial sync did not reconcile watcher startup")
+	}
+}
+
+func TestInitialResyncWatcherStartupOwnerReportsFirstIncompleteAttempt(t *testing.T) {
+	database := dbtest.OpenTestDB(t)
+	missingPath := filepath.Join(t.TempDir(), "missing.jsonl")
+	dbtest.SeedSession(t, database, "existing", "project", func(s *db.Session) {
+		s.FilePath = &missingPath
+	})
+	type startupResult struct {
+		stats agentsync.SyncStats
+		err   error
+	}
+	reconciled := make(chan startupResult, 1)
+	engine := agentsync.NewEngine(database, agentsync.EngineConfig{
+		OnStartupReconciled: func(stats agentsync.SyncStats, err error) {
+			reconciled <- startupResult{stats: stats, err: err}
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	covered, stats := runInitialResync(t.Context(), engine, nil)
+
+	assert.False(t, covered)
+	assert.False(t, stats.Aborted, "incremental fallback is the successful owner")
+	select {
+	case got := <-reconciled:
+		assert.True(t, got.stats.Aborted,
+			"dispatch reports the first incomplete attempt without waiting for fallback")
+		assert.ErrorContains(t, got.err, "startup discovery incomplete")
+	case <-time.After(time.Second):
+		require.FailNow(t, "incomplete startup attempt was not reported")
+	}
+}
+
+func TestStartupReconciliationHandlerKeepsDispatchClosedAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	checkpointed := false
+	opened := false
+	handler := newStartupReconciliationHandler(
+		ctx,
+		func(context.Context) error { checkpointed = true; return nil },
+		func() { opened = true },
+	)
+
+	handler(agentsync.SyncStats{}, nil)
+	assert.False(t, checkpointed)
+	assert.False(t, opened)
+}
+
+func TestStartupReconciliationHandlerCheckpointErrorStillOpensDispatch(t *testing.T) {
+	opened := false
+	handler := newStartupReconciliationHandler(
+		t.Context(),
+		func(context.Context) error { return errors.New("checkpoint unavailable") },
+		func() { opened = true },
+	)
+
+	handler(agentsync.SyncStats{}, nil)
+	assert.True(t, opened,
+		"committed reconciliation remains valid after a best-effort checkpoint error")
+}
+
+func TestStartupReconciliationHandlerPartialDiscoveryStillOpensDispatch(t *testing.T) {
+	checkpointed := false
+	opened := false
+	handler := newStartupReconciliationHandler(
+		t.Context(),
+		func(context.Context) error { checkpointed = true; return nil },
+		func() { opened = true },
+	)
+
+	handler(agentsync.SyncStats{}, errors.New("one provider unavailable"))
+
+	assert.False(t, checkpointed,
+		"an incomplete startup pass must not checkpoint as authoritative")
+	assert.True(t, opened,
+		"a failed provider must not strand native watcher dispatch")
+}
+
+func TestStartupReconciliationHandlerLogsBusyCheckpointBeforeOpeningDispatch(
+	t *testing.T,
+) {
+	logs := captureLogOutput(t)
+	opened := false
+	loggedBeforeOpen := false
+	handler := newStartupReconciliationHandler(
+		t.Context(),
+		func(context.Context) error { return db.ErrWALCheckpointBusy },
+		func() {
+			loggedBeforeOpen = strings.Contains(
+				logs.String(), db.ErrWALCheckpointBusy.Error(),
+			)
+			opened = true
+		},
+	)
+
+	handler(agentsync.SyncStats{}, nil)
+
+	assert.Contains(t, logs.String(), "post-sync wal checkpoint")
+	assert.Contains(t, logs.String(), db.ErrWALCheckpointBusy.Error())
+	assert.True(t, loggedBeforeOpen, "busy checkpoint must be logged before dispatch")
+	assert.True(t, opened,
+		"busy checkpoint is logged but committed reconciliation still opens dispatch")
+}
+
+func TestStartFileWatcherKeepsPollingWhenAnyPendingRootLacksCoverage(t *testing.T) {
+	root := t.TempDir()
+	roots := []watchRoot{
+		{path: filepath.Join(root, "state", "sessions"), recursive: true, scopes: []watchScope{{agent: parser.AgentDevin, syncDir: root}}},
+		{path: filepath.Join(root, "state", "archive"), recursive: true, scopes: []watchScope{{agent: parser.AgentDevin, syncDir: root}}},
+	}
+
+	got := accountRegisteredWatchRoots(
+		[]string{root}, roots,
+		[]agentsync.RecursiveWatchResult{{Watched: 1}, {Unwatched: 1, Err: errors.New("descriptor unavailable")}},
+	)
+
+	assert.Equal(t, []string{root}, got)
+}
+
+func TestStartFileWatcherKeepsPollingForIndependentReasonAfterPendingCoverage(t *testing.T) {
+	root := t.TempDir()
+	roots := []watchRoot{
+		{
+			path: filepath.Join(root, "state", "sessions"), recursive: true,
+			scopes:             []watchScope{{agent: parser.AgentDevin, syncDir: root}},
+			pendingPollingDirs: []string{root},
+		},
+		{
+			path: root, exists: true,
+			scopes:                []watchScope{{agent: parser.AgentDevin, syncDir: root}},
+			persistentPollingDirs: []string{root},
+		},
+	}
+
+	got := accountRegisteredWatchRoots(
+		[]string{root}, roots,
+		[]agentsync.RecursiveWatchResult{{
+			Watched:                   1,
+			MissingRootLifecycleOwned: true,
+		}, {Watched: 1}},
+	)
+
+	assert.Equal(t, []string{root}, got,
+		"covering a missing root must not erase an independent polling reason")
+}
+
+func TestWatchPollingObligationsMissingRootLifecycleCardinality(t *testing.T) {
+	for _, rootCount := range []int{1, 128} {
+		t.Run(fmt.Sprintf("roots=%d", rootCount), func(t *testing.T) {
+			base := t.TempDir()
+			roots := make([]watchRoot, 0, rootCount)
+			owned := make([]agentsync.RecursiveWatchResult, 0, rootCount)
+			portable := make([]agentsync.RecursiveWatchResult, 0, rootCount)
+			unwatched := make([]string, 0, rootCount)
+			for i := range rootCount {
+				syncDir := filepath.Join(base, fmt.Sprintf("agent-%03d", i))
+				roots = append(roots, watchRoot{
+					path:               filepath.Join(syncDir, "sessions"),
+					recursive:          true,
+					scopes:             []watchScope{{agent: parser.AgentClaude, syncDir: syncDir}},
+					pendingPollingDirs: []string{syncDir},
+				})
+				owned = append(owned, agentsync.RecursiveWatchResult{
+					Watched:                   1,
+					MissingRootLifecycleOwned: true,
+				})
+				portable = append(portable, agentsync.RecursiveWatchResult{})
+				unwatched = append(unwatched, syncDir)
+			}
+
+			assert.Empty(t, watchPollingObligations(roots, owned, nil),
+				"native lifecycle work must remain independent of configured archive cardinality")
+			assert.Len(t, watchPollingObligations(roots, portable, unwatched), rootCount,
+				"portable backends retain one obligation per uncovered missing root")
+		})
+	}
+}
+
+func TestOpenCodeFormatMissingRootsUseNativeLifecycleWithoutPolling(t *testing.T) {
+	for _, rootCount := range []int{1, 128} {
+		t.Run(fmt.Sprintf("roots=%d", rootCount), func(t *testing.T) {
+			base := t.TempDir()
+			dirs := make([]string, 0, rootCount)
+			for i := range rootCount {
+				dirs = append(dirs, filepath.Join(base, fmt.Sprintf("mimocode-%03d", i)))
+			}
+			cfg := config.Config{AgentDirs: map[parser.AgentType][]string{
+				parser.AgentMiMoCode: dirs,
+			}}
+
+			roots, unwatched := collectWatchRoots(cfg)
+			require.Len(t, roots, rootCount)
+			results := make([]agentsync.RecursiveWatchResult, rootCount)
+			for i := range results {
+				results[i] = agentsync.RecursiveWatchResult{
+					Watched:                   1,
+					MissingRootLifecycleOwned: true,
+				}
+			}
+			unwatched = accountRegisteredWatchRoots(unwatched, roots, results)
+
+			assert.Empty(t, watchPollingObligations(roots, results, unwatched),
+				"absent OpenCode-format providers must not add archive-scale polling")
+		})
+	}
+}
+
+func TestWatchPollingObligationsKeepPendingAndPersistentReasonsIndependent(t *testing.T) {
+	shared := filepath.Join(t.TempDir(), "shared")
+	pendingPath := filepath.Join(shared, "pending")
+	roots := []watchRoot{
+		{
+			path:               pendingPath,
+			scopes:             []watchScope{{agent: parser.AgentDevin, syncDir: shared}},
+			pendingPollingDirs: []string{shared},
+		},
+		{
+			path: filepath.Join(shared, "existing"), exists: true,
+			scopes:                []watchScope{{agent: parser.AgentDevin, syncDir: shared}},
+			persistentPollingDirs: []string{shared},
+		},
+	}
+
+	got := watchPollingObligations(
+		roots,
+		[]agentsync.RecursiveWatchResult{{Watched: 1}, {Watched: 1}},
+		[]string{shared},
+	)
+
+	assert.Equal(t, []agentsync.PollingObligation{
+		{Key: pendingPath, Roots: []string{shared}, Probe: pendingPath},
+		{Key: "persistent:" + shared, Roots: []string{shared}, Probe: shared},
+	}, got)
+}
+
+func TestWatchPollingObligationsCoverRegistrationFailureByLogicalRoot(t *testing.T) {
+	syncDir := t.TempDir()
+	watchPath := filepath.Join(syncDir, "sessions")
+	roots := []watchRoot{{
+		path: watchPath, exists: true, recursive: true,
+		scopes: []watchScope{{agent: parser.AgentClaude, syncDir: syncDir}},
+	}}
+
+	got := watchPollingObligations(
+		roots,
+		[]agentsync.RecursiveWatchResult{{Unwatched: 1, Err: errors.New("watch failed")}},
+		[]string{syncDir},
+	)
+
+	assert.Equal(t, []agentsync.PollingObligation{{
+		Key: watchPath, Roots: []string{syncDir}, Probe: watchPath,
+	}}, got)
+}
+
 func findCollectedWatchRoot(roots []watchRoot, path string) (watchRoot, bool) {
 	path = filepath.Clean(path)
 	for _, root := range roots {
-		if filepath.Clean(root.root) == path {
+		if filepath.Clean(root.path) == path {
 			return root, true
 		}
 	}
@@ -1472,52 +1862,509 @@ func TestSchemaUpgradeHint(t *testing.T) {
 }
 
 type watchSyncRecorder struct {
-	pathCalls          [][]string
-	fullCalls          int
-	fullProgressNonNil bool
-	ctxValue           any
+	pathCalls      [][]string
+	pathErr        error
+	lookupResults  map[string]bool
+	lookupCalls    [][2]string
+	reconcileCalls []watchReconcileCall
+	reconcileRoots map[string][]string
+	reconcileErr   error
+	callOrder      []string
+	ctxValue       any
 }
 
-func (r *watchSyncRecorder) SyncPathsContext(ctx context.Context, paths []string) {
+type watchReconcileCall struct {
+	roots      []string
+	full       bool
+	lostEvents bool
+}
+
+type watchRetryBatchError interface {
+	error
+	WatchRetryBatch() agentsync.WatchBatch
+}
+
+type scopedReconciliationError struct {
+	roots []string
+}
+
+func (e scopedReconciliationError) Error() string { return "partial reconciliation" }
+
+func (e scopedReconciliationError) ReconciliationRetryRoots() []string {
+	return append([]string(nil), e.roots...)
+}
+
+func requireWatchRetryBatch(t *testing.T, err error) agentsync.WatchBatch {
+	t.Helper()
+	var retryErr watchRetryBatchError
+	require.ErrorAs(t, err, &retryErr)
+	return retryErr.WatchRetryBatch()
+}
+
+func (r *watchSyncRecorder) SyncPathsContext(ctx context.Context, paths []string) error {
 	r.pathCalls = append(r.pathCalls, append([]string(nil), paths...))
+	r.callOrder = append(r.callOrder, "paths")
 	r.ctxValue = ctx.Value(watchSyncContextKey{})
+	return r.pathErr
 }
 
-func (r *watchSyncRecorder) SyncAllAfterWatcherOverflow(
-	ctx context.Context, progress agentsync.ProgressFunc,
-) agentsync.SyncStats {
-	r.fullCalls++
-	r.fullProgressNonNil = progress != nil
+func (r *watchSyncRecorder) HasActiveSessionSourceBelow(agent, path string) (bool, error) {
+	r.lookupCalls = append(r.lookupCalls, [2]string{agent, path})
+	return r.lookupResults[agent+"\x00"+path], nil
+}
+
+func (r *watchSyncRecorder) ReconciliationRootsForAgent(agent string) []string {
+	return append([]string(nil), r.reconcileRoots[agent]...)
+}
+
+func (r *watchSyncRecorder) ReconcileWatchRoots(
+	ctx context.Context, roots []string, full bool,
+) error {
+	r.reconcileCalls = append(r.reconcileCalls, watchReconcileCall{
+		roots: append([]string(nil), roots...),
+		full:  full,
+	})
+	r.callOrder = append(r.callOrder, "reconcile")
 	r.ctxValue = ctx.Value(watchSyncContextKey{})
-	return agentsync.SyncStats{}
+	return r.reconcileErr
+}
+
+func (r *watchSyncRecorder) ReconcileWatchRootsAfterLostEvents(
+	ctx context.Context, roots []string, full bool,
+) error {
+	r.reconcileCalls = append(r.reconcileCalls, watchReconcileCall{
+		roots:      append([]string(nil), roots...),
+		full:       full,
+		lostEvents: true,
+	})
+	r.callOrder = append(r.callOrder, "reconcile")
+	r.ctxValue = ctx.Value(watchSyncContextKey{})
+	return r.reconcileErr
 }
 
 type watchSyncContextKey struct{}
 
-func TestSyncWatchBatchRoutesOverflowToFullSync(t *testing.T) {
+func TestSyncWatchBatch(t *testing.T) {
 	ctx := context.WithValue(context.Background(), watchSyncContextKey{}, "serve")
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "session.jsonl")
+	require.NoError(t, os.WriteFile(filePath, []byte("session"), 0o600))
+	dirPath := filepath.Join(tempDir, "renamed-dir")
+	require.NoError(t, os.Mkdir(dirPath, 0o700))
+	missingPath := filepath.Join(tempDir, "missing")
+	root := filepath.Join(tempDir, "root")
+	agent := string(parser.AgentCodex)
 
-	t.Run("ordinary paths", func(t *testing.T) {
+	t.Run("file rename uses changed path", func(t *testing.T) {
 		recorder := &watchSyncRecorder{}
-		syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{Renames: []agentsync.WatchRename{{
+			Path: filePath, Root: root, Agent: agent, ItemType: agentsync.ItemIsFile,
+		}}})
+
+		require.NoError(t, err)
+		assert.Equal(t, [][]string{{filePath}}, recorder.pathCalls)
+		assert.Empty(t, recorder.lookupCalls)
+		assert.Empty(t, recorder.reconcileCalls)
+		assert.Equal(t, "serve", recorder.ctxValue)
+	})
+
+	t.Run("directory rename reconciles only owning provider roots", func(t *testing.T) {
+		otherRoot := filepath.Join(tempDir, "other-root")
+		recorder := &watchSyncRecorder{reconcileRoots: map[string][]string{
+			agent: {root, otherRoot},
+		}}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{Renames: []agentsync.WatchRename{{
+			Path: dirPath, Root: root, Agent: agent, ItemType: agentsync.ItemIsDir,
+		}}})
+
+		require.NoError(t, err)
+		assert.Empty(t, recorder.pathCalls)
+		assert.Empty(t, recorder.lookupCalls)
+		assert.Equal(t, []watchReconcileCall{{roots: []string{root, otherRoot}}}, recorder.reconcileCalls)
+	})
+
+	t.Run("directory rename includes every shared-root owner", func(t *testing.T) {
+		claude := string(parser.AgentClaude)
+		claudeRoot := filepath.Join(tempDir, "claude-root")
+		recorder := &watchSyncRecorder{reconcileRoots: map[string][]string{
+			agent:  {root},
+			claude: {claudeRoot},
+		}}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{Renames: []agentsync.WatchRename{
+			{Path: dirPath, Root: root, Agent: agent, ItemType: agentsync.ItemIsDir},
+			{Path: dirPath, Root: root, Agent: claude, ItemType: agentsync.ItemIsDir},
+		}})
+
+		require.NoError(t, err)
+		assert.Equal(t, []watchReconcileCall{{roots: []string{root, claudeRoot}}}, recorder.reconcileCalls)
+	})
+
+	t.Run("unknown rename stats file", func(t *testing.T) {
+		recorder := &watchSyncRecorder{}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{Renames: []agentsync.WatchRename{{
+			Path: filePath, Root: root, Agent: agent, ItemType: agentsync.ItemIsUnknown,
+		}}})
+
+		require.NoError(t, err)
+		assert.Equal(t, [][]string{{filePath}}, recorder.pathCalls)
+		assert.Empty(t, recorder.lookupCalls)
+		assert.Empty(t, recorder.reconcileCalls)
+	})
+
+	for _, tc := range []struct {
+		name     string
+		itemType agentsync.WatchItemType
+		path     string
+	}{
+		{name: "directory metadata", itemType: agentsync.ItemIsDir, path: missingPath},
+		{name: "unknown rename stats directory", itemType: agentsync.ItemIsUnknown, path: dirPath},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := &watchSyncRecorder{}
+			err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{Renames: []agentsync.WatchRename{{
+				Path: tc.path, Root: root, Agent: agent, ItemType: tc.itemType,
+			}}})
+
+			require.NoError(t, err)
+			assert.Empty(t, recorder.pathCalls)
+			assert.Empty(t, recorder.lookupCalls)
+			assert.Equal(t, []watchReconcileCall{{full: true}}, recorder.reconcileCalls)
+		})
+	}
+
+	t.Run("missing unknown with active descendant reconciles fully", func(t *testing.T) {
+		recorder := &watchSyncRecorder{lookupResults: map[string]bool{
+			agent + "\x00" + missingPath: true,
+		}}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{Renames: []agentsync.WatchRename{{
+			Path: missingPath, Root: root, Agent: agent, ItemType: agentsync.ItemIsUnknown,
+		}}})
+
+		require.NoError(t, err)
+		assert.Empty(t, recorder.pathCalls)
+		assert.Equal(t, [][2]string{{agent, missingPath}}, recorder.lookupCalls)
+		assert.Equal(t, []watchReconcileCall{{full: true}}, recorder.reconcileCalls)
+	})
+
+	t.Run("missing unknown without active descendant emits tombstone path", func(t *testing.T) {
+		recorder := &watchSyncRecorder{}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{Renames: []agentsync.WatchRename{{
+			Path: missingPath, Root: root, Agent: agent, ItemType: agentsync.ItemIsUnknown,
+		}}})
+
+		require.NoError(t, err)
+		assert.Equal(t, [][]string{{missingPath}}, recorder.pathCalls)
+		assert.Equal(t, [][2]string{{agent, missingPath}}, recorder.lookupCalls)
+		assert.Empty(t, recorder.reconcileCalls)
+	})
+
+	t.Run("overlapping unrelated agent source does not promote", func(t *testing.T) {
+		recorder := &watchSyncRecorder{lookupResults: map[string]bool{
+			string(parser.AgentClaude) + "\x00" + missingPath: true,
+		}}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{Renames: []agentsync.WatchRename{{
+			Path: missingPath, Root: root, Agent: agent, ItemType: agentsync.ItemIsUnknown,
+		}}})
+
+		require.NoError(t, err)
+		assert.Equal(t, [][2]string{{agent, missingPath}}, recorder.lookupCalls)
+		assert.Equal(t, [][]string{{missingPath}}, recorder.pathCalls)
+		assert.Empty(t, recorder.reconcileCalls)
+	})
+
+	t.Run("any exact shared-root owner can promote", func(t *testing.T) {
+		claude := string(parser.AgentClaude)
+		recorder := &watchSyncRecorder{lookupResults: map[string]bool{
+			claude + "\x00" + missingPath: true,
+		}}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{Renames: []agentsync.WatchRename{
+			{Path: missingPath, Root: root, Agent: claude, ItemType: agentsync.ItemIsUnknown},
+			{Path: missingPath, Root: root, Agent: agent, ItemType: agentsync.ItemIsUnknown},
+		}})
+
+		require.NoError(t, err)
+		assert.Equal(t, [][2]string{{claude, missingPath}, {agent, missingPath}}, recorder.lookupCalls)
+		assert.Empty(t, recorder.pathCalls)
+		assert.Equal(t, []watchReconcileCall{{full: true}}, recorder.reconcileCalls)
+	})
+
+	t.Run("ordinary paths precede deduplicated root reconciliation", func(t *testing.T) {
+		recorder := &watchSyncRecorder{}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			Paths:          []string{"/sessions/a.jsonl", "/sessions/b.jsonl"},
+			ReconcileRoots: []string{"/sessions", "/sessions"},
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{"paths", "reconcile"}, recorder.callOrder)
+		assert.Equal(t, []watchReconcileCall{{roots: []string{"/sessions"}}}, recorder.reconcileCalls)
+	})
+
+	t.Run("root-count overflow reconciles all roots directly", func(t *testing.T) {
+		recorder := &watchSyncRecorder{}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			FullSync: true, LostEvents: true,
+		})
+
+		require.NoError(t, err)
+		assert.Empty(t, recorder.pathCalls)
+		assert.Equal(t, []watchReconcileCall{{full: true, lostEvents: true}}, recorder.reconcileCalls)
+		assert.Equal(t, "serve", recorder.ctxValue)
+	})
+
+	t.Run("reconciliation error is returned for watcher retry", func(t *testing.T) {
+		reconcileErr := errors.New("provider discovery incomplete")
+		recorder := &watchSyncRecorder{reconcileErr: reconcileErr}
+
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			ReconcileRoots: []string{"/sessions"},
+		})
+
+		assert.ErrorContains(t, err, reconcileErr.Error())
+		assert.Equal(t, []watchReconcileCall{{roots: []string{"/sessions"}}}, recorder.reconcileCalls)
+	})
+
+	t.Run("full reconciliation retries only failed provider roots", func(t *testing.T) {
+		failedRoot := "/sessions/unavailable-provider"
+		reconcileErr := scopedReconciliationError{roots: []string{failedRoot}}
+		recorder := &watchSyncRecorder{reconcileErr: reconcileErr}
+
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			FullSync: true, LostEvents: true,
+		})
+
+		assert.ErrorContains(t, err, reconcileErr.Error())
+		assert.Equal(t, agentsync.WatchBatch{
+			ReconcileRoots: []string{failedRoot},
+			LostEvents:     true,
+		}, requireWatchRetryBatch(t, err))
+	})
+
+	t.Run("scoped lost-event retry keeps forced recovery", func(t *testing.T) {
+		root := "/sessions/unavailable-provider"
+		recorder := &watchSyncRecorder{}
+
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			ReconcileRoots: []string{root},
+			LostEvents:     true,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, []watchReconcileCall{{
+			roots: []string{root}, lostEvents: true,
+		}}, recorder.reconcileCalls)
+	})
+
+	t.Run("changed path failure retains the exact bounded batch", func(t *testing.T) {
+		pathErr := errors.New("archive write failed")
+		recorder := &watchSyncRecorder{pathErr: pathErr}
+
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
 			Paths: []string{"/sessions/a.jsonl", "/sessions/b.jsonl"},
 		})
 
-		assert.Equal(t, [][]string{{
-			"/sessions/a.jsonl",
-			"/sessions/b.jsonl",
-		}}, recorder.pathCalls)
-		assert.Zero(t, recorder.fullCalls)
-		assert.Equal(t, "serve", recorder.ctxValue)
+		assert.ErrorIs(t, err, pathErr)
+		assert.Equal(t, agentsync.WatchBatch{
+			Paths: []string{"/sessions/a.jsonl", "/sessions/b.jsonl"},
+		}, requireWatchRetryBatch(t, err))
+		assert.Empty(t, recorder.reconcileCalls)
 	})
 
-	t.Run("overflow", func(t *testing.T) {
-		recorder := &watchSyncRecorder{}
-		syncWatchBatch(ctx, recorder, agentsync.WatchBatch{FullSync: true})
+	t.Run("changed path failure retains pending root reconciliation", func(t *testing.T) {
+		pathErr := errors.New("archive write failed")
+		recorder := &watchSyncRecorder{pathErr: pathErr}
 
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			Paths:          []string{"/sessions/a.jsonl"},
+			ReconcileRoots: []string{"/sessions", "/sessions"},
+		})
+
+		assert.ErrorIs(t, err, pathErr)
+		assert.Equal(t, agentsync.WatchBatch{
+			Paths:          []string{"/sessions/a.jsonl"},
+			ReconcileRoots: []string{"/sessions"},
+		}, requireWatchRetryBatch(t, err))
+		assert.Empty(t, recorder.reconcileCalls)
+	})
+
+	t.Run("changed path failure retains directory rename reconciliation", func(t *testing.T) {
+		pathErr := errors.New("archive write failed")
+		recorder := &watchSyncRecorder{pathErr: pathErr}
+
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			Paths: []string{"/sessions/a.jsonl"},
+			Renames: []agentsync.WatchRename{{
+				Path: dirPath, Root: root, Agent: agent, ItemType: agentsync.ItemIsDir,
+			}},
+		})
+
+		assert.ErrorIs(t, err, pathErr)
+		assert.Equal(t, agentsync.WatchBatch{FullSync: true}, requireWatchRetryBatch(t, err))
+		assert.Empty(t, recorder.reconcileCalls)
+	})
+}
+
+type stubRetryRootsError struct{ roots []string }
+
+func (e *stubRetryRootsError) Error() string { return "reconciliation incomplete" }
+
+func (e *stubRetryRootsError) ReconciliationRetryRoots() []string { return e.roots }
+
+// TestGapReconciliationRetryBatch pins the startup-gap classification: a gap
+// reconciliation error carrying retry roots yields a scoped retry batch, and
+// any other failure escalates to an authoritative full sync.
+func TestGapReconciliationRetryBatch(t *testing.T) {
+	scoped := gapReconciliationRetryBatch(fmt.Errorf(
+		"gap: %w", &stubRetryRootsError{roots: []string{"/b", "/a", "/a"}},
+	))
+	assert.Equal(t, agentsync.WatchBatch{
+		ReconcileRoots: []string{"/b", "/a"},
+	}, scoped)
+
+	full := gapReconciliationRetryBatch(errors.New("plain failure"))
+	assert.Equal(t, agentsync.WatchBatch{FullSync: true}, full)
+
+	empty := gapReconciliationRetryBatch(fmt.Errorf(
+		"gap: %w", &stubRetryRootsError{},
+	))
+	assert.Equal(t, agentsync.WatchBatch{FullSync: true}, empty,
+		"an empty retry scope must escalate to a full sync")
+}
+
+func TestSyncWatchBatchReportsClassifiedReconciliationRetryScope(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "session.jsonl")
+	require.NoError(t, os.WriteFile(filePath, []byte("session"), 0o600))
+	dirPath := filepath.Join(tempDir, "renamed-dir")
+	require.NoError(t, os.Mkdir(dirPath, 0o700))
+	missingPath := filepath.Join(tempDir, "missing")
+	root := filepath.Join(tempDir, "root")
+	agent := string(parser.AgentCodex)
+	reconcileErr := errors.New("provider discovery incomplete")
+
+	t.Run("unknown rename that stats as file retries roots", func(t *testing.T) {
+		recorder := &watchSyncRecorder{reconcileErr: reconcileErr}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			Renames: []agentsync.WatchRename{{
+				Path: filePath, Root: root, Agent: agent,
+				ItemType: agentsync.ItemIsUnknown,
+			}},
+			ReconcileRoots: []string{root, root},
+		})
+
+		assert.ErrorIs(t, err, reconcileErr)
+		assert.Equal(t, agentsync.WatchBatch{
+			ReconcileRoots: []string{root},
+		}, requireWatchRetryBatch(t, err))
+		assert.Equal(t, [][]string{{filePath}}, recorder.pathCalls)
+		assert.Empty(t, recorder.lookupCalls)
+		assert.Equal(t, []watchReconcileCall{{roots: []string{root}}}, recorder.reconcileCalls)
+	})
+
+	t.Run("missing unknown rename with negative lookup retries roots", func(t *testing.T) {
+		recorder := &watchSyncRecorder{reconcileErr: reconcileErr}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{
+			Renames: []agentsync.WatchRename{{
+				Path: missingPath, Root: root, Agent: agent,
+				ItemType: agentsync.ItemIsUnknown,
+			}},
+			ReconcileRoots: []string{root, root},
+		})
+
+		assert.ErrorIs(t, err, reconcileErr)
+		assert.Equal(t, agentsync.WatchBatch{
+			ReconcileRoots: []string{root},
+		}, requireWatchRetryBatch(t, err))
+		assert.Equal(t, [][]string{{missingPath}}, recorder.pathCalls)
+		assert.Equal(t, [][2]string{{agent, missingPath}}, recorder.lookupCalls)
+		assert.Equal(t, []watchReconcileCall{{roots: []string{root}}}, recorder.reconcileCalls)
+	})
+
+	t.Run("directory rename retries full reconciliation", func(t *testing.T) {
+		recorder := &watchSyncRecorder{reconcileErr: reconcileErr}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{Renames: []agentsync.WatchRename{{
+			Path: dirPath, Root: root, Agent: agent,
+			ItemType: agentsync.ItemIsDir,
+		}}})
+
+		assert.ErrorIs(t, err, reconcileErr)
+		assert.Equal(t, agentsync.WatchBatch{FullSync: true}, requireWatchRetryBatch(t, err))
 		assert.Empty(t, recorder.pathCalls)
-		assert.Equal(t, 1, recorder.fullCalls)
-		assert.False(t, recorder.fullProgressNonNil)
-		assert.Equal(t, "serve", recorder.ctxValue)
+		assert.Empty(t, recorder.lookupCalls)
+		assert.Equal(t, []watchReconcileCall{{full: true}}, recorder.reconcileCalls)
 	})
+
+	t.Run("missing unknown rename with positive lookup retries full reconciliation", func(t *testing.T) {
+		recorder := &watchSyncRecorder{
+			reconcileErr: reconcileErr,
+			lookupResults: map[string]bool{
+				agent + "\x00" + missingPath: true,
+			},
+		}
+		err := syncWatchBatch(ctx, recorder, agentsync.WatchBatch{Renames: []agentsync.WatchRename{{
+			Path: missingPath, Root: root, Agent: agent,
+			ItemType: agentsync.ItemIsUnknown,
+		}}})
+
+		assert.ErrorIs(t, err, reconcileErr)
+		assert.Equal(t, agentsync.WatchBatch{FullSync: true}, requireWatchRetryBatch(t, err))
+		assert.Empty(t, recorder.pathCalls)
+		assert.Equal(t, [][2]string{{agent, missingPath}}, recorder.lookupCalls)
+		assert.Equal(t, []watchReconcileCall{{full: true}}, recorder.reconcileCalls)
+	})
+}
+
+// The serve daemon installs its default soft memory limit only when the
+// operator has not set GOMEMLIMIT themselves.
+func TestApplyServeMemoryLimit(t *testing.T) {
+	prev := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(prev) })
+
+	t.Run("sets the default when GOMEMLIMIT is unset", func(t *testing.T) {
+		t.Setenv("GOMEMLIMIT", "")
+		debug.SetMemoryLimit(math.MaxInt64)
+		applyServeMemoryLimit()
+		assert.Equal(t, int64(serveMemoryLimitBytes),
+			debug.SetMemoryLimit(-1))
+	})
+
+	t.Run("respects an operator override", func(t *testing.T) {
+		t.Setenv("GOMEMLIMIT", "1GiB")
+		debug.SetMemoryLimit(math.MaxInt64)
+		applyServeMemoryLimit()
+		assert.Equal(t, int64(math.MaxInt64), debug.SetMemoryLimit(-1))
+	})
+}
+
+// An absent configured root (unmounted volume, deleted directory) or a
+// present root whose physical session subtree is missing (Gemini's
+// <root>/tmp) streams an empty discovery without error, so the gap
+// reconciliation and archive audit must defer those scopes instead of
+// tombstoning every session beneath them.
+func TestReconcileRootPathsDefersUnavailableScopes(t *testing.T) {
+	presentDir := t.TempDir()
+	missingDir := filepath.Join(t.TempDir(), "gone")
+	geminiRoot := t.TempDir()
+	cfg := config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {presentDir, missingDir},
+			parser.AgentGemini: {geminiRoot},
+		},
+	}
+
+	paths := reconcileRootPaths(cfg)
+
+	assert.Contains(t, paths, presentDir)
+	assert.NotContains(t, paths, missingDir,
+		"an absent configured root must be deferred, not reconciled as empty")
+	assert.NotContains(t, paths, geminiRoot,
+		"a configured dir whose physical session subtree is missing keeps that subtree as its probe")
+	assert.NotContains(t, paths, filepath.Join(geminiRoot, "tmp"),
+		"the missing physical subtree itself must not be reconciled")
+
+	require.NoError(t, os.MkdirAll(filepath.Join(geminiRoot, "tmp"), 0o755))
+	paths = reconcileRootPaths(cfg)
+	assert.Contains(t, paths, filepath.Join(geminiRoot, "tmp"),
+		"a present physical subtree rejoins the reconciliation scope")
 }

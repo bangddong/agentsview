@@ -273,7 +273,7 @@ const duckSessionCols = `id, project, machine, agent,
 	cwd, git_branch, source_session_id, source_version, transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	secret_leak_count, secrets_rules_version,
-	deleted_at, termination_status, transcript_revision`
+	deleted_at, deletion_cause, termination_status, transcript_revision`
 
 func scanSession(rs interface{ Scan(...any) error }) (db.Session, error) {
 	var s db.Session
@@ -307,7 +307,7 @@ func scanSession(rs interface{ Scan(...any) error }) (db.Session, error) {
 		&s.SourceSessionID, &s.SourceVersion, &s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.SecretLeakCount, &s.SecretsRulesVersion,
-		&deletedAt, &s.TerminationStatus, &s.TranscriptRevision,
+		&deletedAt, &s.DeletionCause, &s.TerminationStatus, &s.TranscriptRevision,
 	)
 	if err != nil {
 		return s, err
@@ -613,6 +613,19 @@ func (s *Store) GetSessionFull(ctx context.Context, id string) (*db.Session, err
 		return nil, fmt.Errorf("getting duckdb full session: %w", err)
 	}
 	return &sess, nil
+}
+
+func (s *Store) ListTrashedSessions(ctx context.Context) ([]db.Session, error) {
+	rows, err := s.queryContext(ctx,
+		"SELECT "+duckSessionCols+` FROM sessions
+		 WHERE deleted_at IS NOT NULL AND deletion_cause IS NULL
+		 ORDER BY deleted_at DESC, id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing duckdb trash: %w", err)
+	}
+	defer rows.Close()
+	return scanSessionRows(rows)
 }
 
 func (s *Store) GetChildSessions(ctx context.Context, parentID string) ([]db.Session, error) {

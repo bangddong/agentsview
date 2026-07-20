@@ -331,6 +331,11 @@ const (
 // the WAL because another connection still had pages pinned.
 var ErrWALCheckpointBusy = errors.New("wal checkpoint busy")
 
+// ErrWriterClosed reports that a write was attempted while the writer pool was
+// intentionally closed for a maintenance pass (a sync-worker handoff). Readers
+// keep serving; the writer returns once ReopenWriter runs.
+var ErrWriterClosed = errors.New("writer closed for maintenance pass")
+
 // DataVersionTooNewError reports that an archive was written by a newer
 // agentsview parser than the current binary understands.
 type DataVersionTooNewError struct {
@@ -360,6 +365,8 @@ const ClassifierHashKey = "is_automated_classifier_hash"
 
 //go:embed schema.sql
 var schemaSQL string
+
+const sourceBaselineTableMigrationKey = "local_source_baseline_table_v1"
 
 // messagesADTriggerDDL is the AFTER DELETE trigger that mirrors row
 // removals into the FTS5 shadow tables. ReplaceSessionMessages drops
@@ -490,14 +497,18 @@ END;
 // concurrent HTTP handler goroutines can safely read while
 // Reopen/CloseConnections swap the underlying *sql.DB.
 type DB struct {
-	path      string
-	writer    atomic.Pointer[sql.DB]
-	reader    atomic.Pointer[sql.DB]
-	mu        sync.Mutex // serializes writes
-	connMu    sync.RWMutex
-	retired   []*sql.DB // old pools kept open for in-flight reads
-	readOnly  bool
-	dataStale atomic.Bool // set by Open when user_version < dataVersion
+	path     string
+	writer   atomic.Pointer[sql.DB]
+	reader   atomic.Pointer[sql.DB]
+	mu       sync.Mutex // serializes writes
+	connMu   sync.RWMutex
+	retired  []*sql.DB // old pools kept open for in-flight reads
+	readOnly bool
+	// writerClosed is set while the writer pool is intentionally closed for a
+	// worker maintenance pass (CloseWriter). It lets write attempts report
+	// ErrWriterClosed instead of the generic read-only error.
+	writerClosed atomic.Bool
+	dataStale    atomic.Bool // set by Open when user_version < dataVersion
 
 	cursorMu     sync.RWMutex
 	cursorSecret []byte
@@ -600,6 +611,9 @@ func (w *writerHandle) current() (*sql.DB, error) {
 	}
 	db := w.owner.writer.Load()
 	if db == nil {
+		if w.owner.writerClosed.Load() {
+			return nil, ErrWriterClosed
+		}
 		return nil, ErrReadOnly
 	}
 	return db, nil
@@ -1626,6 +1640,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"ALTER TABLE sessions ADD COLUMN deleted_at TEXT",
 		},
 		{
+			"sessions", "deletion_cause",
+			"ALTER TABLE sessions ADD COLUMN deletion_cause TEXT",
+		},
+		{
 			"messages", "is_system",
 			"ALTER TABLE messages ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0",
 		},
@@ -1876,6 +1894,14 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"ALTER TABLE sessions ADD COLUMN last_entry_uuid TEXT",
 		},
 		{
+			// Whether the Claude full parser fell back to linear
+			// processing for this file (NULL = unknown/legacy or
+			// non-Claude). Read by the incremental parser to skip
+			// fork detection on linear-bound transcripts.
+			"sessions", "claude_linear_parse",
+			"ALTER TABLE sessions ADD COLUMN claude_linear_parse INTEGER",
+		},
+		{
 			"messages", "thinking_text",
 			"ALTER TABLE messages ADD COLUMN thinking_text TEXT NOT NULL DEFAULT ''",
 		},
@@ -2086,6 +2112,9 @@ func (db *DB) migrateColumns() error {
 		return err
 	}
 	if err := installSyncMarkerSchemaLocked(w); err != nil {
+		return err
+	}
+	if err := db.migrateSourceBaselinesLocked(w); err != nil {
 		return err
 	}
 	if err := db.createPartialIndexesLocked(w); err != nil {
@@ -2383,6 +2412,60 @@ func execSchemaScriptLocked(w *writerHandle) error {
 	return nil
 }
 
+// migrateSourceBaselinesLocked imports watcher proof written by early builds
+// of the bounded-reconciliation branch. The marker prevents a later user
+// restore from being re-authorized by the obsolete sessions column on reopen.
+func (db *DB) migrateSourceBaselinesLocked(w *writerHandle) error {
+	tx, err := w.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("starting local source baseline migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec("DROP INDEX IF EXISTS idx_sessions_source_baseline_active"); err != nil {
+		return fmt.Errorf("dropping obsolete source baseline index: %w", err)
+	}
+	var completed int
+	if err := tx.QueryRow(`
+		SELECT count(*) FROM archive_metadata WHERE key = ?`,
+		sourceBaselineTableMigrationKey,
+	).Scan(&completed); err != nil {
+		return fmt.Errorf("checking local source baseline migration: %w", err)
+	}
+	if completed == 0 {
+		var legacyColumns int
+		if err := tx.QueryRow(`
+			SELECT count(*) FROM pragma_table_info('sessions')
+			WHERE name = 'source_baseline_path'`,
+		).Scan(&legacyColumns); err != nil {
+			return fmt.Errorf("probing legacy source baseline column: %w", err)
+		}
+		if legacyColumns > 0 {
+			if _, err := tx.Exec(`
+				INSERT INTO local_session_source_baselines
+					(session_id, machine, agent, file_path)
+				SELECT id, machine, agent, file_path
+				FROM sessions
+				WHERE file_path IS NOT NULL
+				  AND source_baseline_path = file_path
+				ON CONFLICT(session_id) DO UPDATE SET
+					machine = excluded.machine,
+					agent = excluded.agent,
+					file_path = excluded.file_path`); err != nil {
+				return fmt.Errorf("importing legacy source baselines: %w", err)
+			}
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO archive_metadata (key, value)
+			VALUES (?, '1')`, sourceBaselineTableMigrationKey); err != nil {
+			return fmt.Errorf("recording local source baseline migration: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing local source baseline migration: %w", err)
+	}
+	return nil
+}
+
 func (db *DB) scrubProjectIdentityGitRemoteCredentialsLocked(
 	w *writerHandle,
 ) error {
@@ -2452,14 +2535,46 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 		   AND model != '<synthetic>'`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
-		`CREATE INDEX IF NOT EXISTS idx_sessions_agent_file_path_active
-		 ON sessions(agent, file_path)
-		 WHERE file_path IS NOT NULL AND deleted_at IS NULL`,
 	}
 	for _, ddl := range indexes {
 		if _, err := w.Exec(ddl); err != nil {
 			return fmt.Errorf("creating index: %w", err)
 		}
+	}
+	var sourceIndexColumns sql.NullString
+	if err := w.QueryRow(`
+		SELECT group_concat(name, ',')
+		FROM (
+			SELECT name
+			FROM pragma_index_info('idx_sessions_agent_file_path_active')
+			ORDER BY seqno
+		)`).Scan(&sourceIndexColumns); err != nil {
+		return fmt.Errorf("probing active session source index: %w", err)
+	}
+	var sourceIndexSQL sql.NullString
+	if err := w.QueryRow(`
+		SELECT sql FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_sessions_agent_file_path_active'
+	`).Scan(&sourceIndexSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reading active session source index: %w", err)
+	}
+	normalizedSourceIndexSQL := strings.ToLower(
+		strings.Join(strings.Fields(sourceIndexSQL.String), " "),
+	)
+	if sourceIndexColumns.String != "agent,file_path,id" ||
+		!strings.Contains(normalizedSourceIndexSQL,
+			"where file_path is not null and deleted_at is null") {
+		if _, err := w.Exec(
+			`DROP INDEX IF EXISTS idx_sessions_agent_file_path_active`,
+		); err != nil {
+			return fmt.Errorf("dropping legacy active session source index: %w", err)
+		}
+	}
+	if _, err := w.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_sessions_agent_file_path_active
+		ON sessions(agent, file_path, id)
+		WHERE file_path IS NOT NULL AND deleted_at IS NULL`); err != nil {
+		return fmt.Errorf("creating active session source index: %w", err)
 	}
 	if _, err := w.Exec(
 		`DROP INDEX IF EXISTS idx_messages_usage_timestamp`,
@@ -3489,10 +3604,12 @@ func (db *DB) CloseConnections() error {
 	for _, p := range db.retired {
 		errs = append(errs, p.Close())
 	}
-	errs = append(errs,
-		db.rawReader().Close(),
-		db.rawWriter().Close(),
-	)
+	errs = append(errs, db.rawReader().Close())
+	// The writer pool is nil when a worker maintenance pass has it closed.
+	// Guard the close so this lifecycle path can never nil-deref.
+	if w := db.rawWriter(); w != nil {
+		errs = append(errs, w.Close())
+	}
 	db.retired = nil
 	return errors.Join(errs...)
 }
@@ -3542,12 +3659,25 @@ func (db *DB) reopenLocked() error {
 	retired := append([]*sql.DB(nil), db.retired...)
 	oldWriter := db.writer.Swap(writer)
 	oldReader := db.reader.Swap(reader)
+	// Reopen fully restores the writer pool, so clear any writer-closed barrier
+	// a prior CloseWriter set. Without this a resync swap that ran behind the
+	// worker write barrier would reopen the pool yet keep rejecting writes.
+	db.writerClosed.Store(false)
 
 	// Retire the just-swapped pools. Concurrent readers that
 	// loaded the old pointer before the swap may still have
 	// in-flight queries; these pools will be closed on the
-	// next Reopen, CloseConnections, or Close call.
-	db.retired = []*sql.DB{oldWriter, oldReader}
+	// next Reopen, CloseConnections, or Close call. Skip a nil
+	// old writer: a Reopen that follows CloseWriter swaps out a
+	// nil pool, and retiring it would nil-deref on the next close.
+	var freshRetired []*sql.DB
+	if oldWriter != nil {
+		freshRetired = append(freshRetired, oldWriter)
+	}
+	if oldReader != nil {
+		freshRetired = append(freshRetired, oldReader)
+	}
+	db.retired = freshRetired
 	db.connMu.Unlock()
 
 	// Close pools from earlier reopens outside connMu. database/sql
@@ -3563,6 +3693,81 @@ func (db *DB) reopenLocked() error {
 	return nil
 }
 
+// CloseWriter closes the writer pool without touching the reader pool, so
+// read-only queries keep serving while a sync-worker owns the archive for a
+// maintenance pass. Writes attempted while closed return ErrWriterClosed. The
+// reader pool is mode=ro and cannot checkpoint, so it holds the WAL open across
+// the handoff; the worker attaches to the same WAL. Callers must call
+// ReopenWriter to restore write service.
+//
+// Failure posture: the writer pointer is swapped to nil (marking the barrier
+// active) before the old pool is closed, so if Close itself errors the daemon
+// stays writer-closed and the caller keeps the flock rather than reopening. A
+// possible double-writer racing the worker over the same archive is worse than
+// staying read-only until the daemon restarts.
+func (db *DB) CloseWriter() error {
+	if db.readOnly {
+		return ErrReadOnly
+	}
+	db.stopWALCheckpointLoop()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.connMu.Lock()
+	old := db.writer.Swap(nil)
+	db.writerClosed.Store(true)
+	db.connMu.Unlock()
+
+	if old == nil {
+		return nil
+	}
+	if err := old.Close(); err != nil {
+		return fmt.Errorf("closing writer pool: %w", err)
+	}
+	return nil
+}
+
+// ReopenWriter reopens the writer pool after a worker maintenance pass. It
+// re-runs the writer-open half of Reopen (writable DSN, single connection,
+// configureWAL) and restarts the WAL checkpoint loop. The reader pool is left
+// untouched.
+func (db *DB) ReopenWriter() error {
+	if db.readOnly {
+		return ErrReadOnly
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	writer, err := sql.Open("sqlite3", makeDSN(db.path, false))
+	if err != nil {
+		return fmt.Errorf("reopening writer: %w", err)
+	}
+	writer.SetMaxOpenConns(1)
+	if err := configureWAL(writer); err != nil {
+		writer.Close()
+		return fmt.Errorf("configuring reopened wal: %w", err)
+	}
+
+	db.connMu.Lock()
+	old := db.writer.Swap(writer)
+	db.writerClosed.Store(false)
+	db.connMu.Unlock()
+
+	if old != nil {
+		if err := old.Close(); err != nil {
+			log.Printf("warning: closing stale writer pool: %v", err)
+		}
+	}
+	db.startWALCheckpointLoop()
+	return nil
+}
+
+// WriterClosed reports whether the writer pool is currently closed for a
+// maintenance pass. Callers that conditionally own the write barrier check it to
+// avoid double-closing or reopening a barrier an outer owner holds.
+func (db *DB) WriterClosed() bool {
+	return db.writerClosed.Load()
+}
+
 // Update executes fn within a write lock and transaction.
 // The transaction is committed if fn returns nil, rolled back
 // otherwise.
@@ -3570,6 +3775,12 @@ func (db *DB) Update(fn func(tx *sql.Tx) error) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// Fail fast before handing out a raw *sql.Tx: while the writer is closed
+	// for a worker maintenance pass the pool pointer is nil, and a caller must
+	// see ErrWriterClosed rather than a transaction from a torn-down pool.
+	if db.writerClosed.Load() {
+		return ErrWriterClosed
+	}
 	tx, err := db.getWriter().Begin()
 	if err != nil {
 		return fmt.Errorf("beginning transaction: %w", err)

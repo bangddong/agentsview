@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -69,10 +70,6 @@ func TestSQLiteContainerPassPromotesOnlyPreDiscoveryCaptures(t *testing.T) {
 		trusted := e.trustedSQLiteContainers[dbPath]
 		assert.Equal(t, pre, trusted.state,
 			"trusted state must be exactly the pre-discovery capture")
-		assert.Equal(t,
-			map[string]struct{}{"ses-1": {}, "ses-2": {}},
-			trusted.sessions,
-			"trusted set must be exactly the verified session IDs")
 	})
 }
 
@@ -116,7 +113,7 @@ func TestSQLiteContainerPassFailsOnCaptureDiscoveryMismatch(t *testing.T) {
 	// The container is trusted at the pre-discovery state, as after a
 	// fully verified idle pass.
 	e.trustedSQLiteContainers = map[string]trustedSQLiteContainer{
-		dbPath: {state: pre, sessions: map[string]struct{}{"ses-1": {}}},
+		dbPath: {state: pre},
 	}
 
 	// The container changes inside the capture-discovery window.
@@ -148,7 +145,8 @@ func TestSQLiteContainerPassFailsOnCaptureDiscoveryMismatch(t *testing.T) {
 // pass discovered, and only those may gate-skip; a newly exposed row was
 // never verified against the archive and must parse.
 func TestSQLiteContainerGateParsesNewlyUnshadowedSession(t *testing.T) {
-	e := &Engine{}
+	archive := openTestDB(t)
+	e := &Engine{db: archive}
 	dbPath, _ := newContainerTestDB(t)
 	state, ok := parser.StatSQLiteContainerState(dbPath)
 	require.True(t, ok, "container state must be readable")
@@ -157,6 +155,15 @@ func TestSQLiteContainerGateParsesNewlyUnshadowedSession(t *testing.T) {
 	// shadowed by its storage JSON at the time.
 	verified := parser.DiscoveredFile{
 		Agent: parser.AgentOpenCode, Path: dbPath + "#ses-1",
+	}
+	verifiedPath := verified.Path
+	replacementPath := filepath.Join(t.TempDir(), "ses-2.json")
+	for _, session := range []db.Session{
+		{ID: "opencode:ses-1", Agent: "opencode", Project: "project", Machine: "local", FilePath: &verifiedPath},
+		{ID: "opencode:ses-2", Agent: "opencode", Project: "project", Machine: "local", FilePath: &replacementPath},
+	} {
+		require.NoError(t, archive.UpsertSession(session))
+		require.NoError(t, archive.SetSessionDataVersion(session.ID, db.CurrentDataVersion()))
 	}
 	e.beginSQLiteContainerPass(
 		[]parser.DiscoveredFile{verified},
@@ -192,9 +199,7 @@ func TestSQLiteContainerGateParsesNewlyUnshadowedSession(t *testing.T) {
 func TestSQLiteContainerFullPassDropsUndiscoveredTrust(t *testing.T) {
 	trusted := func() map[string]trustedSQLiteContainer {
 		return map[string]trustedSQLiteContainer{
-			"/data/opencode.db": {
-				sessions: map[string]struct{}{"ses-1": {}},
-			},
+			"/data/opencode.db": {},
 		}
 	}
 

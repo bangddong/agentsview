@@ -11,7 +11,7 @@ import (
 // lookup, and fingerprinting come from JSONLSourceSet, and the ParseFile option
 // makes that source set a full SourceSet so it rides the generic factory.
 func newZencoderProviderFactory(def AgentDef) ProviderFactory {
-	return NewSourceSetFactory(
+	return NewStreamingSourceSetFactory(
 		def,
 		zencoderProviderCapabilities(),
 		func(cfg ProviderConfig) SourceSet { return newZencoderSourceSet(cfg.Roots) },

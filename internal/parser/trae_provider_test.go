@@ -136,6 +136,42 @@ func TestTraeWatchChangedPathAndVirtualLookup(t *testing.T) {
 	}
 }
 
+// Watcher sidecar events (workspace.json, -wal) must scope stored-source
+// hints to the owning state.vscdb container, not the whole watch root, so
+// changed-path hint queries stay bounded by the affected container.
+func TestTraeStoredSourceHintScopesResolveEventToContainer(t *testing.T) {
+	root := t.TempDir()
+	workspaceDB := filepath.Join(
+		root, "workspaceStorage", "hash-a", traeStateDBName,
+	)
+	globalDB := filepath.Join(root, "globalStorage", traeStateDBName)
+	writeTraeDB(t, workspaceDB, traeFixtureValue(t), "")
+	writeTraeDB(t, globalDB, traeFixtureValue(t), "")
+	factory, ok := ProviderFactoryByType(AgentTrae)
+	require.True(t, ok)
+	provider := factory.NewProvider(ProviderConfig{Roots: []string{root}})
+	resolver, ok := provider.(StoredSourceHintScopeProvider)
+	require.True(t, ok, "trae provider must resolve stored-source hint scopes")
+
+	workspaceScopes := resolver.StoredSourceHintScopes(ChangedPathRequest{
+		Path: filepath.Join(
+			root, "workspaceStorage", "hash-a", "workspace.json",
+		),
+		WatchRoot: filepath.Join(root, "workspaceStorage"),
+	})
+	require.Len(t, workspaceScopes, 1)
+	assert.Equal(t, workspaceDB, workspaceScopes[0].Path)
+	assert.True(t, workspaceScopes[0].IncludeVirtualMembers)
+
+	globalScopes := resolver.StoredSourceHintScopes(ChangedPathRequest{
+		Path:      globalDB + "-wal",
+		WatchRoot: filepath.Join(root, "globalStorage"),
+	})
+	require.Len(t, globalScopes, 1)
+	assert.Equal(t, globalDB, globalScopes[0].Path)
+	assert.True(t, globalScopes[0].IncludeVirtualMembers)
+}
+
 func TestTraeWorkspaceChangedPathAndRawExport(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "workspaceStorage", "hash", traeStateDBName)

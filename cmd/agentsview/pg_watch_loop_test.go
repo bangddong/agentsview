@@ -3,8 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // newTestLoop wires a pushLoop with caller-controlled timers.
@@ -118,6 +122,79 @@ func TestPushLoop_ErrorDoesNotStopLoop(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("loop did not survive a push error")
 	}
+}
+
+func TestPushLoop_NotifyDirtyWithAckWaitsForSuccessfulRetry(t *testing.T) {
+	attempts := make(chan pushReason, 2)
+	pushErr := errors.New("target unavailable")
+	call := 0
+	l, fire, _ := newTestLoop(func(_ context.Context, reason pushReason) error {
+		call++
+		attempts <- reason
+		if call == 1 {
+			return pushErr
+		}
+		return nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go l.Run(ctx)
+
+	ack := l.NotifyDirtyWithAck()
+	fire <- time.Now()
+	require.Equal(t, reasonChange, <-attempts)
+	select {
+	case err := <-ack:
+		require.Fail(t, "failed push acknowledged dirty generation", "%v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Failure retains the dirty generation and rearms debounce without a
+	// second producer notification.
+	fire <- time.Now()
+	require.Equal(t, reasonChange, <-attempts)
+	require.NoError(t, <-ack)
+}
+
+func TestPushLoop_NotifyDirtyWithAckIsNonBlockingAndCoalescesWaiters(t *testing.T) {
+	l, fire, _ := newTestLoop(func(context.Context, pushReason) error { return nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go l.Run(ctx)
+
+	first := l.NotifyDirtyWithAck()
+	second := l.NotifyDirtyWithAck()
+	assert.NotNil(t, first)
+	assert.NotNil(t, second)
+	fire <- time.Now()
+	require.NoError(t, <-first)
+	require.NoError(t, <-second)
+}
+
+func TestPushWatchFallbackCoverageRequiresActiveFloorAndBoundsDiagnostics(t *testing.T) {
+	loop, _, _ := newTestLoop(func(context.Context, pushReason) error { return nil })
+	roots := make([]string, 0, maxPushWatchDegradedRoots+2)
+	for i := range maxPushWatchDegradedRoots + 2 {
+		roots = append(roots, fmt.Sprintf("/root-%d", i))
+	}
+	roots = append(roots, "/root-0")
+
+	require.NoError(t, loop.NotifyCoverageDegraded(roots))
+	pending, waiters := func() (bool, int) {
+		loop.pendingMu.Lock()
+		defer loop.pendingMu.Unlock()
+		return loop.pending, len(loop.waiters)
+	}()
+	assert.True(t, pending)
+	assert.Zero(t, waiters)
+	assert.Equal(t, pushWatchCoverageDiagnostics{
+		RootCount: maxPushWatchDegradedRoots,
+		Overflow:  true,
+		Floor:     true,
+	}, loop.coverageDiagnostics())
+
+	withoutFloor := &pushLoop{dirty: make(chan struct{}, 1)}
+	assert.ErrorIs(t, withoutFloor.NotifyCoverageDegraded([]string{"/root"}), errPushWatchFloorInactive)
 }
 
 func TestPushLoop_ShutdownFlushes(t *testing.T) {

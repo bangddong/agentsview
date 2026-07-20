@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at           TIMESTAMPTZ,
     deleted_at         TIMESTAMPTZ,
     source_deleted_at  TIMESTAMPTZ,
+    deletion_cause     TEXT,
     message_count      INT NOT NULL DEFAULT 0,
     user_message_count INT NOT NULL DEFAULT 0,
     parent_session_id  TEXT,
@@ -474,6 +475,11 @@ func EnsureSchema(
 			"sessions", "source_deleted_at",
 			`source_deleted_at TIMESTAMPTZ`,
 			"adding sessions.source_deleted_at",
+		},
+		{
+			"sessions", "deletion_cause",
+			`deletion_cause TEXT`,
+			"adding sessions.deletion_cause",
 		},
 		{
 			"sessions", "total_output_tokens",
@@ -1851,7 +1857,7 @@ func CheckSchemaCompat(
 	rows.Close()
 
 	rows, err = db.QueryContext(ctx,
-		`SELECT source_display_name, source_deleted_at
+		`SELECT source_display_name, source_deleted_at, deletion_cause
 		 FROM sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(

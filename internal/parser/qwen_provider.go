@@ -13,7 +13,7 @@ import (
 // JSONLSourceSet, and the ParseFile option makes that source set a full
 // SourceSet so it rides the generic factory.
 func newQwenProviderFactory(def AgentDef) ProviderFactory {
-	return NewSourceSetFactory(
+	return NewStreamingSourceSetFactory(
 		def,
 		qwenProviderCapabilities(),
 		func(cfg ProviderConfig) SourceSet { return newQwenSourceSet(cfg.Roots) },

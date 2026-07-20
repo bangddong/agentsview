@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -40,44 +39,10 @@ func callParseClaudeSessionFrom(
 func callParseClaudeSessionFromWithLinks(
 	path string, offset int64, startOrdinal int, lastEntryUUID string,
 ) ([]ParsedMessage, []ClaudeSubagentLink, time.Time, int64, error) {
-	fn := reflect.ValueOf(claudeParseSessionFrom)
-	args := []reflect.Value{
-		reflect.ValueOf(path),
-		reflect.ValueOf(offset),
-		reflect.ValueOf(startOrdinal),
-	}
-	if fn.Type().NumIn() >= 4 {
-		args = append(args, reflect.ValueOf(lastEntryUUID))
-	}
-	if fn.Type().NumIn() >= 5 {
-		args = append(args, reflect.ValueOf(claudeStoredIdentity{}))
-	}
-	out := fn.Call(args)
-
-	var msgs []ParsedMessage
-	if !out[0].IsNil() {
-		msgs = out[0].Interface().([]ParsedMessage)
-	}
-	var links []ClaudeSubagentLink
-	endedIdx := 1
-	consumedIdx := 2
-	errIdx := 3
-	if len(out) == 5 {
-		if !out[1].IsNil() {
-			links = out[1].Interface().([]ClaudeSubagentLink)
-		}
-		endedIdx = 2
-		consumedIdx = 3
-		errIdx = 4
-	}
-	endedAt := out[endedIdx].Interface().(time.Time)
-	consumed := out[consumedIdx].Interface().(int64)
-
-	var err error
-	if !out[errIdx].IsNil() {
-		err = out[errIdx].Interface().(error)
-	}
-	return msgs, links, endedAt, consumed, err
+	return claudeParseSessionFrom(path, offset, claudeIncrementalScan{
+		startOrdinal:  startOrdinal,
+		lastEntryUUID: lastEntryUUID,
+	})
 }
 
 // TestParseClaudeSession_UsageProbe verifies that sessions whose only
@@ -887,7 +852,11 @@ func TestParseClaudeSessionFrom_ReminderPrefixedCommand(t *testing.T) {
 	assert.Equal(t, "/clear", newMsgs[0].Content)
 }
 
-func TestParseClaudeSessionFrom_SystemReminderToolResultsFallBack(
+// A tool_result whose tool_use lives outside the appended window is
+// carried to the stored tool call as a typed result link instead of
+// forcing a full parse. The engine applies it through the same
+// tool-call update path as subagent links.
+func TestParseClaudeSessionFrom_ToolResultForStoredCallLinksIncrementally(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -908,9 +877,57 @@ func TestParseClaudeSessionFrom_SystemReminderToolResultsFallBack(
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = callParseClaudeSessionFrom(path, info.Size(), 2, "")
-	assert.ErrorIs(t, err, ErrClaudeIncrementalNeedsFullParse)
-	assert.True(t, IsIncrementalFullParseFallback(err))
+	_, links, _, _, err := callParseClaudeSessionFromWithLinks(
+		path, info.Size(), 2, "",
+	)
+	require.NoError(t, err)
+	require.Len(t, links, 1)
+	assert.Equal(t, "toolu_r", links[0].ToolUseID)
+	assert.Empty(t, links[0].SubagentSessionID)
+	assert.True(t, links[0].HasResult)
+	assert.Equal(t, "tool output", DecodeContent(links[0].ResultContentRaw))
+	assert.Equal(t, len("tool output"), links[0].ResultContentLen)
+}
+
+// A tool_result matched by a tool_use inside the same append pairs at
+// write time; no generic result link is emitted for it. An isMeta
+// carrier's result is dropped by the full parser too, so it emits no
+// link either.
+func TestParseClaudeSessionFrom_MatchedAndMetaToolResultsEmitNoLink(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	initial := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("hello", tsEarly),
+	)
+	path := createTestFile(t, "inc-matched-tool-result.jsonl", initial)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+
+	appended := `{"type":"assistant","uuid":"a1","parentUuid":"pre",` +
+		`"timestamp":"` + tsEarlyS5 +
+		`","message":{"id":"msg_m","content":[{"type":"tool_use",` +
+		`"id":"toolu_in","name":"Bash","input":{"command":"ls"}}]}}` + "\n" +
+		`{"type":"user","uuid":"u2","parentUuid":"a1",` +
+		`"timestamp":"` + tsLate +
+		`","message":{"content":[{"type":"tool_result",` +
+		`"tool_use_id":"toolu_in","content":"in-append","is_error":false}]}}` + "\n" +
+		`{"type":"user","uuid":"u3","parentUuid":"u2","isMeta":true,` +
+		`"timestamp":"` + tsLate +
+		`","message":{"content":[{"type":"tool_result",` +
+		`"tool_use_id":"toolu_meta","content":"meta result","is_error":false}]}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, links, _, _, err := callParseClaudeSessionFromWithLinks(
+		path, info.Size(), 1, "",
+	)
+	require.NoError(t, err)
+	assert.Empty(t, links)
 }
 
 func TestParseClaudeSessionFrom_SkipsNonMessages(
@@ -1138,6 +1155,103 @@ func TestParseClaudeSessionFrom_DAGAcrossNonUUID(
 	assert.ErrorIs(t, err, ErrDAGDetected)
 }
 
+// Real CLI transcripts route the uuid chain through attachment and
+// system lines, so their full parses always fall back to linear
+// processing and the session is stored linear-bound. For such
+// sessions the incremental path must accept chain breaks (the full
+// parser ignores parent uuids there too); without a stored linearity
+// verdict it must stay conservative and fall back.
+func TestParseClaudeSessionFrom_LinearBoundSessionAcceptsChainBreaks(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		linearParse *bool
+		wantDAGErr  bool
+	}{
+		{
+			name:        "linear-bound session stays incremental",
+			linearParse: new(true),
+			wantDAGErr:  false,
+		},
+		{
+			name:        "unknown verdict stays conservative",
+			linearParse: nil,
+			wantDAGErr:  true,
+		},
+		{
+			name:        "dag-resolvable session falls back",
+			linearParse: new(false),
+			wantDAGErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := createTestFile(
+				t, "inc-linear-bound.jsonl",
+				testjsonl.JoinJSONL(
+					testjsonl.ClaudeUserJSON("hello", tsEarly),
+				),
+			)
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			offset := info.Size()
+
+			// Chain: attachment -> assistant -> system -> user,
+			// exactly as Claude Code writes it. The assistant's
+			// parent is the attachment uuid and the user's parent is
+			// the system uuid; neither is a message entry, so both
+			// breaks are unresolvable for the full parser too.
+			appended := `{"type":"attachment","uuid":"att-1",` +
+				`"parentUuid":"stored-tip",` +
+				`"timestamp":"` + tsEarlyS5 +
+				`","attachment":{"type":"task_reminder"}}` + "\n" +
+				`{"type":"assistant","uuid":"a1",` +
+				`"parentUuid":"att-1",` +
+				`"timestamp":"` + tsEarlyS5 +
+				`","message":{"content":[` +
+				`{"type":"text","text":"reply"}]}}` + "\n" +
+				`{"type":"system","uuid":"sys-1",` +
+				`"parentUuid":"a1",` +
+				`"timestamp":"` + tsLate +
+				`","content":"hook ran"}` + "\n" +
+				`{"type":"user","uuid":"u1",` +
+				`"parentUuid":"sys-1",` +
+				`"timestamp":"` + tsLate +
+				`","message":{"content":"done"}}` + "\n"
+
+			f, err := os.OpenFile(
+				path, os.O_APPEND|os.O_WRONLY, 0o644,
+			)
+			require.NoError(t, err)
+			_, err = f.WriteString(appended)
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+
+			newMsgs, _, _, _, perr := claudeParseSessionFrom(
+				path, offset, claudeIncrementalScan{
+					startOrdinal:      1,
+					lastEntryUUID:     "stored-tip",
+					storedLinearParse: tt.linearParse,
+				},
+			)
+			if tt.wantDAGErr {
+				assert.ErrorIs(t, perr, ErrDAGDetected)
+				return
+			}
+			require.NoError(t, perr)
+			require.Len(t, newMsgs, 2)
+			assert.Equal(t, RoleAssistant, newMsgs[0].Role)
+			assert.Equal(t, RoleUser, newMsgs[1].Role)
+		})
+	}
+}
+
 func TestParseClaudeSessionFrom_LinearUUID(
 	t *testing.T,
 ) {
@@ -1316,10 +1430,14 @@ func mustJSONString(t *testing.T, value string) string {
 }
 
 // Two appended assistant entries with the same message.id form a
-// run that the full parser merges into one message; the incremental
-// path would otherwise produce two separate stored messages, so it
-// must signal full-parse fallback.
-func TestParseClaudeSessionFrom_SameMessageIDFallsBack(t *testing.T) {
+// streaming run. The incremental path merges the run exactly as the
+// full parser does (mergeClaudeAssistantMessageChunks) and stays
+// incremental, producing one merged message. Runs that straddle a
+// sync boundary are caught by the engine's LastClaudeMessageID check
+// instead.
+func TestParseClaudeSessionFrom_SameMessageIDRunMergesIncrementally(
+	t *testing.T,
+) {
 	t.Parallel()
 
 	initial := testjsonl.JoinJSONL(
@@ -1343,18 +1461,232 @@ func TestParseClaudeSessionFrom_SameMessageIDFallsBack(t *testing.T) {
 		`"timestamp":"` + tsLate +
 		`","message":{"id":"msg_run","content":[` +
 		`{"type":"text","text":"Hi there"}]}}` + "\n"
+	// A user reply chained onto the run's last chunk must stay
+	// linear even though the merged entry's own parent uuid was
+	// swallowed by the merge.
+	u2 := `{"type":"user","uuid":"u2",` +
+		`"parentUuid":"a2",` +
+		`"timestamp":"` + tsLate +
+		`","message":{"content":"thanks"}}` + "\n"
 
 	f, err := os.OpenFile(
 		path, os.O_APPEND|os.O_WRONLY, 0o644,
 	)
 	require.NoError(t, err)
-	_, err = f.WriteString(a1 + a2)
+	_, err = f.WriteString(a1 + a2 + u2)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = callParseClaudeSessionFrom(path, offset, 1, "")
-	assert.ErrorIs(t, err, ErrClaudeIncrementalNeedsFullParse)
-	assert.True(t, IsIncrementalFullParseFallback(err))
+	newMsgs, _, _, err := callParseClaudeSessionFrom(path, offset, 1, "")
+	require.NoError(t, err)
+	require.Len(t, newMsgs, 2)
+	assert.Equal(t, RoleAssistant, newMsgs[0].Role)
+	assert.Equal(t, "Hi there", newMsgs[0].Content)
+	assert.Equal(t, "msg_run", newMsgs[0].ClaudeMessageID)
+	assert.Equal(t, RoleUser, newMsgs[1].Role)
+}
+
+// An appended parentless entry adds a DAG root — the only property of
+// the stored linearity verdict an append can move toward
+// resolvability — so even a linear-bound session must fall back to a
+// full parse to re-derive the verdict.
+func TestParseClaudeSessionFrom_LinearBoundNewRootFallsBack(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	path := createTestFile(
+		t, "inc-linear-new-root.jsonl",
+		testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON("hello", tsEarly),
+		),
+	)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	offset := info.Size()
+
+	appended := `{"type":"user","uuid":"root-2",` +
+		`"timestamp":"` + tsLate +
+		`","message":{"content":"parentless"}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, _, _, perr := claudeParseSessionFrom(
+		path, offset, claudeIncrementalScan{
+			startOrdinal:      1,
+			lastEntryUUID:     "stored-tip",
+			storedLinearParse: new(true),
+		},
+	)
+	assert.ErrorIs(t, perr, ErrDAGDetected)
+}
+
+// The full parser only walks the DAG when every message entry carries
+// a uuid, so a uuid-less append flips a DAG-resolvable transcript to
+// linear processing — restoring branches DAG processing had omitted.
+// DAG-resolvable or unknown sessions must fall back to a full parse on
+// a uuid-less append; linear-bound sessions stay incremental because
+// the full parser already processes them in line order.
+func TestParseClaudeSessionFrom_UUIDLessAppendFallsBackForDAGSessions(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name              string
+		storedLinearParse *bool
+		wantDAGFallback   bool
+	}{
+		{"unknown verdict", nil, true},
+		{"dag-bound", new(false), true},
+		{"linear-bound", new(true), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := createTestFile(
+				t, "inc-uuidless-append.jsonl",
+				testjsonl.JoinJSONL(
+					testjsonl.ClaudeUserJSON("hello", tsEarly),
+				),
+			)
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			offset := info.Size()
+
+			appended := `{"type":"user",` +
+				`"timestamp":"` + tsLate +
+				`","message":{"content":"no uuid on this line"}}` + "\n"
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+			require.NoError(t, err)
+			_, err = f.WriteString(appended)
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+
+			msgs, _, _, _, perr := claudeParseSessionFrom(
+				path, offset, claudeIncrementalScan{
+					startOrdinal:      1,
+					lastEntryUUID:     "stored-tip",
+					storedLinearParse: tc.storedLinearParse,
+				},
+			)
+			if tc.wantDAGFallback {
+				assert.ErrorIs(t, perr, ErrDAGDetected)
+				return
+			}
+			require.NoError(t, perr)
+			require.Len(t, msgs, 1)
+			assert.Equal(t, "no uuid on this line", msgs[0].Content)
+		})
+	}
+}
+
+// Rewinding onto an entry that the full parser resolves in its DAG
+// but that never became a stored message row (a tool-result-only
+// carrier dropped by pairAndFilter, or an isMeta line) is still a real
+// fork. A DAG-resolvable session must therefore fall back to the full
+// parser on any chain break — the break's parent being absent from
+// stored messages proves nothing about the DAG.
+func TestParseClaudeSessionFrom_RewindOntoFilteredEntryFallsBack(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	// Fully resolvable single-root file: u1 <- a1 <- u2 <- a2, where
+	// u2 is a tool-result-only carrier that is filtered from stored
+	// messages but participates in the DAG.
+	initial := testjsonl.JoinJSONL(
+		`{"type":"user","uuid":"u1","timestamp":"`+tsEarly+
+			`","message":{"content":"go"}}`,
+		`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"`+
+			tsEarlyS1+`","message":{"id":"msg_1","content":[{"type":"tool_use",`+
+			`"id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}`,
+		`{"type":"user","uuid":"u2","parentUuid":"a1","timestamp":"`+
+			tsEarlyS1+`","message":{"content":[{"type":"tool_result",`+
+			`"tool_use_id":"toolu_1","content":"out"}]}}`,
+		`{"type":"assistant","uuid":"a2","parentUuid":"u2","timestamp":"`+
+			tsEarlyS5+`","message":{"id":"msg_2","content":[`+
+			`{"type":"text","text":"first answer"}]}}`,
+	)
+	path := createTestFile(t, "inc-rewind-carrier.jsonl", initial)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	offset := info.Size()
+
+	// Rewind: a3 branches from the carrier u2, forking away from a2.
+	appended := `{"type":"assistant","uuid":"a3","parentUuid":"u2",` +
+		`"timestamp":"` + tsLate + `","message":{"id":"msg_3","content":[` +
+		`{"type":"text","text":"retry answer"}]}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, _, _, perr := claudeParseSessionFrom(
+		path, offset, claudeIncrementalScan{
+			startOrdinal:      4,
+			lastEntryUUID:     "a2",
+			storedLinearParse: new(false),
+		},
+	)
+	assert.ErrorIs(t, perr, ErrDAGDetected)
+
+	// The full parse resolves the fork: u2 has children a2 and a3, and
+	// the small-gap retry heuristic follows the latest branch, so a2
+	// is dropped and a3 becomes the tail.
+	results, err := parseClaudeSession(path, "proj", "local")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.NotNil(t, results[0].Session.ClaudeLinearParse)
+	assert.False(t, *results[0].Session.ClaudeLinearParse)
+	var contents []string
+	for _, m := range results[0].Messages {
+		contents = append(contents, m.Content)
+	}
+	assert.NotContains(t, contents, "first answer")
+	assert.Contains(t, contents, "retry answer")
+}
+
+// The parser records its linearity verdict on the session: linear for
+// multi-root or unresolvable-parent files (every real CLI transcript
+// whose chain routes through attachment lines), DAG for resolvable
+// single-root files.
+func TestParseClaudeSession_RecordsLinearParseVerdict(t *testing.T) {
+	t.Parallel()
+
+	linearFile := testjsonl.JoinJSONL(
+		`{"type":"attachment","uuid":"att-1","timestamp":"`+tsEarly+
+			`","attachment":{"type":"task_reminder"}}`,
+		`{"type":"user","uuid":"u1","parentUuid":"att-1","timestamp":"`+
+			tsEarly+`","message":{"content":"hello"}}`,
+		`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"`+
+			tsEarlyS1+`","message":{"content":[{"type":"text","text":"hi"}]}}`,
+	)
+	path := createTestFile(t, "verdict-linear.jsonl", linearFile)
+	results, err := parseClaudeSession(path, "proj", "local")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.NotNil(t, results[0].Session.ClaudeLinearParse)
+	assert.True(t, *results[0].Session.ClaudeLinearParse,
+		"attachment-parented chain must parse linearly")
+
+	dagFile := testjsonl.JoinJSONL(
+		`{"type":"user","uuid":"u1","timestamp":"`+tsEarly+
+			`","message":{"content":"hello"}}`,
+		`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"`+
+			tsEarlyS1+`","message":{"content":[{"type":"text","text":"hi"}]}}`,
+	)
+	path = createTestFile(t, "verdict-dag.jsonl", dagFile)
+	results, err = parseClaudeSession(path, "proj", "local")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.NotNil(t, results[0].Session.ClaudeLinearParse)
+	assert.False(t, *results[0].Session.ClaudeLinearParse,
+		"single-root resolvable chain must record a DAG verdict")
 }
 
 func TestParseClaudeSessionFrom_QueueOperationOnlyFallsBack(t *testing.T) {

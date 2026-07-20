@@ -77,6 +77,7 @@ type SyncStats struct {
 	messagesIndexed        int // unexported: progress message counter
 	parserExcludedFiles    int // file-level intentional parser exclusions
 	parserExcludedIDs      []string
+	providerFailures       int // authoritative discoveries that did not complete
 	// cwdFilteredSessions counts sessions vetoed by the
 	// sync_include_cwd_prefixes allow-list. The resync abort guard uses
 	// it so a run where every discovered session is filtered reads as
